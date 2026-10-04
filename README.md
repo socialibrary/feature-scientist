@@ -62,6 +62,13 @@ features are routed to the appropriate tower's input
 (`provenance["tower"]`: `user` | `movie` | `wide`) and ablated against
 the two-tower baseline.
 
+Learned user/movie ID embeddings (dim 16, index 0 = unknown for cold IDs
+unseen in train) are concatenated onto the tower outputs — on by default,
+`--no-id-embeddings` disables. At 4 epochs they are a wash vs the dense
+baseline (AUC 0.7403 vs 0.7410, within seed noise); they need more epochs
+to pay off. The `--no-id-embeddings` path reproduces the 0.7410 baseline
+exactly.
+
 Train: 800,168 rows (2000-04-25 → 2000-12-02) · Valid: 200,041 rows
 (2000-12-02 → 2003-02-28). Label: `liked = (rating >= 4)`, positive rate ≈ 0.57.
 25 features: train-period-only user/movie aggregates, genre one-hots, user
