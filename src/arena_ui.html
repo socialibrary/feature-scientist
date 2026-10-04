@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Feature Scientist — Arena</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#131822; --panel2:#0f141d; --line:#232b3a;
+    --txt:#e6edf3; --dim:#8b94a3; --green:#3fb950; --red:#f85149;
+    --amber:#d29922; --gray:#6e7681; --blue:#58a6ff; --violet:#bc8cff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+       padding:24px;max-width:1100px;margin-left:auto;margin-right:auto}
+  header.top{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-bottom:6px}
+  h1{font-size:22px;margin:0;letter-spacing:.3px}
+  h1 .lab{color:var(--violet)}
+  .pill{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:600;
+        padding:5px 12px;border-radius:999px;border:1px solid var(--line);background:var(--panel)}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--gray)}
+  .pill.live .dot{background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 1.6s infinite}
+  .pill.wait .dot{background:var(--amber);box-shadow:0 0 8px var(--amber);animation:pulse 1.6s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:16px 0 22px}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .stat .k{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px}
+  .stat .v{font-size:22px;font-weight:700;margin-top:4px;font-variant-numeric:tabular-nums}
+  .stat .v.green{color:var(--green)} .stat .v.red{color:var(--red)}
+  .stat .v.amber{color:var(--amber)} .stat .v.blue{color:var(--blue)}
+  h2{font-size:15px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;
+     margin:26px 0 12px;border-bottom:1px solid var(--line);padding-bottom:8px}
+  .board{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .brow{display:grid;grid-template-columns:44px 1fr 110px 110px;gap:8px;align-items:center;
+        padding:10px 14px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
+  .brow:last-child{border-bottom:none}
+  .brow.head{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;background:var(--panel2)}
+  .brow .rank{font-weight:700;color:var(--amber)}
+  .brow .fname{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
+  .brow .delta{color:var(--green);font-weight:700;text-align:right}
+  .round{margin-bottom:18px}
+  .round > .rhead{display:flex;align-items:center;gap:10px;margin:14px 0 10px}
+  .round > .rhead .rn{font-weight:800;font-size:14px;background:var(--panel);
+    border:1px solid var(--line);border-radius:8px;padding:4px 12px}
+  .cards{display:grid;gap:10px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .card .chead{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:8px}
+  .chip{font-size:11px;font-weight:700;padding:3px 10px;border-radius:999px;letter-spacing:.3px}
+  .chip.accepted{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.5)}
+  .chip.leakage{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.55)}
+  .chip.cost{background:rgba(210,153,34,.15);color:var(--amber);border:1px solid rgba(210,153,34,.55)}
+  .chip.nolift{background:rgba(110,118,129,.15);color:var(--gray);border:1px solid rgba(110,118,129,.5)}
+  .chip.trap{background:rgba(188,140,255,.15);color:var(--violet);border:1px dashed rgba(188,140,255,.6)}
+  .card.leakage{border-color:rgba(248,81,73,.65);box-shadow:0 0 18px rgba(248,81,73,.18)}
+  .card.cost{border-color:rgba(210,153,34,.5)}
+  .card.accepted{border-color:rgba(63,185,80,.5)}
+  .hyp{font-size:14px;line-height:1.5;margin:0 0 10px}
+  .fname{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;color:var(--blue)}
+  .meta{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+  .tag{font-size:11px;color:var(--dim);background:var(--panel2);border:1px solid var(--line);
+       border-radius:6px;padding:2px 8px}
+  .verdict{font-size:13px;color:var(--dim);margin:6px 0 0;line-height:1.5}
+  .verdict strong{color:var(--txt)}
+  details{margin-top:8px}
+  details summary{cursor:pointer;font-size:12px;color:var(--dim)}
+  details ul{margin:8px 0 2px;padding-left:18px;font-size:12.5px;color:var(--dim);line-height:1.6}
+  details ul li::marker{color:var(--red)}
+  .card.accepted details ul li::marker{color:var(--green)}
+  .delta-inline{color:var(--green);font-weight:700;font-variant-numeric:tabular-nums}
+  .empty{background:var(--panel);border:1px dashed var(--line);border-radius:12px;
+         padding:48px 24px;text-align:center;color:var(--dim)}
+  .empty code{color:var(--blue);font-size:13px}
+  .empty .big{font-size:40px;margin-bottom:12px}
+  footer{margin-top:28px;color:var(--dim);font-size:11.5px;text-align:center}
+  .flash{animation:flash 1.2s}
+  @keyframes flash{0%{box-shadow:0 0 0 2px var(--blue)}100%{box-shadow:none}}
+</style>
+</head>
+<body>
+<header class="top">
+  <h1>🔬 Feature Scientist <span class="lab">— Arena</span></h1>
+  <span class="pill wait" id="statusPill"><span class="dot"></span><span id="statusTxt">connecting…</span></span>
+</header>
+
+<div class="stats" id="stats"></div>
+
+<h2>🏆 Leaderboard — accepted features</h2>
+<div class="board" id="board"><div class="brow"><span style="grid-column:1/-1;color:var(--dim)">loading…</span></div></div>
+
+<h2>🧪 Experiment timeline</h2>
+<div id="timeline"></div>
+
+<footer>Feature Scientist · hackathon demo · auto-refreshes every 3s · ledger: results/experiments.jsonl</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s==null?"":s).replace(/[&<>"']/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let lastHash = "";
+
+const CHIP = {
+  "accepted":          ["accepted","✓ ACCEPTED"],
+  "rejected:leakage":  ["leakage","🚨 REJECTED · LEAKAGE"],
+  "rejected:cost":     ["cost","💸 REJECTED · TOO EXPENSIVE"],
+  "rejected:no-lift":  ["nolift","📉 REJECTED · NO LIFT"],
+};
+const chipCls = c => c==="accepted" ? "accepted" : c.split(":")[1];
+
+function fmtDelta(d){
+  if (d==null || typeof d!=="number") return "—";
+  const s = (d>0?"+":"")+d.toFixed(4);
+  return s;
+}
+
+async function tick(){
+  try{
+    const [sRes, lRes] = await Promise.all([
+      fetch("/api/summary").then(r=>r.json()),
+      fetch("/api/ledger").then(r=>r.json())
+    ]);
+    const hash = JSON.stringify([sRes.n_entries, sRes.last_ts]);
+    render(sRes, lRes.entries||[]);
+    if (hash !== lastHash){
+      lastHash = hash;
+      document.body.classList.remove("flash");
+      void document.body.offsetWidth;
+      if (sRes.n_entries) document.body.classList.add("flash");
+    }
+  }catch(e){
+    $("statusTxt").textContent = "server unreachable";
+  }
+}
+
+function render(s, entries){
+  // status pill
+  const pill = $("statusPill");
+  if (s.status === "live"){
+    pill.className = "pill live";
+    $("statusTxt").textContent = "LIVE · "+s.n_entries+" experiments";
+  } else {
+    pill.className = "pill wait";
+    $("statusTxt").textContent = "WAITING FOR FIRST RUN";
+  }
+  // stats
+  const c = s.counts||{};
+  const stat = (k,v,cls)=>`<div class="stat"><div class="k">${k}</div><div class="v ${cls||""}">${v}</div></div>`;
+  $("stats").innerHTML =
+    stat("baseline AUC", s.baseline_auc!=null?Number(s.baseline_auc).toFixed(4):"—", "blue") +
+    stat("best ΔAUC", s.best_delta_auc!=null?fmtDelta(s.best_delta_auc):"—", "green") +
+    stat("accepted", c.accepted||0, "green") +
+    stat("caught: leakage", c["rejected:leakage"]||0, "red") +
+    stat("killed: cost", c["rejected:cost"]||0, "amber") +
+    stat("no lift", c["rejected:no-lift"]||0, "");
+
+  // leaderboard
+  const acc = entries.filter(e=>e.category==="accepted")
+    .sort((a,b)=>((b.metrics||{}).delta_auc||0)-((a.metrics||{}).delta_auc||0));
+  if (!acc.length){
+    $("board").innerHTML = `<div class="brow"><span style="grid-column:1/-1;color:var(--dim)">no accepted features yet — the agent is still thinking…</span></div>`;
+  } else {
+    $("board").innerHTML =
+      `<div class="brow head"><span>#</span><span>feature</span><span style="text-align:right">ΔAUC</span><span style="text-align:right">tower</span></div>` +
+      acc.map((e,i)=>{
+        const m=e.metrics||{};
+        return `<div class="brow"><span class="rank">${i+1}</span>`+
+        `<span class="fname">${esc(e.feature_name)}</span>`+
+        `<span class="delta">${fmtDelta(m.delta_auc)}</span>`+
+        `<span style="text-align:right;color:var(--dim);font-size:12px">${esc(m.tower||"—")}</span></div>`;
+      }).join("");
+  }
+
+  // timeline
+  const tl = $("timeline");
+  if (!entries.length){
+    tl.innerHTML = `<div class="empty"><div class="big">⏳</div>
+      <div><strong>Waiting for the first run.</strong></div>
+      <div style="margin-top:10px">In another terminal:<br><code>.venv/bin/python src/run_scientist.py --rounds 4</code><br>
+      then watch this page — hypotheses appear here live.</div></div>`;
+    return;
+  }
+  const rounds = {};
+  entries.forEach(e=>{ const r=e.round||0; (rounds[r]=rounds[r]||[]).push(e); });
+  tl.innerHTML = Object.keys(rounds).sort((a,b)=>a-b).map(r=>{
+    const cards = rounds[r].map(e=>{
+      const [cls,label] = CHIP[e.category]||["nolift",e.category];
+      const m = e.metrics||{};
+      const audit = (e.leakage_audit||{}).reasons||[];
+      const cost  = ((e.serving_cost||{}).reasons)||[];
+      const why = [...audit.map(x=>["audit",x]), ...cost.map(x=>["cost",x])]
+        .map(([k,x])=>`<li><strong style="color:var(--dim)">${k}:</strong> ${esc(x)}</li>`).join("");
+      const tags = (e.sources||[]).map(x=>`<span class="tag">${esc(x)}</span>`).join("")+
+        `<span class="tag">tower: ${esc(m.tower||"—")}</span>`+
+        `<span class="tag">temporal: ${esc(e.temporal_scope||"—")}</span>`+
+        `<span class="tag">serving: ${esc(e.serving||"—")}</span>`;
+      const deltaLine = (e.category==="accepted" && m.delta_auc!=null)
+        ? ` <span class="delta-inline">ΔAUC ${fmtDelta(m.delta_auc)}</span>` : "";
+      const trap = e.trap ? `<span class="chip trap">🎯 planted trap</span>` : "";
+      return `<div class="card ${chipCls(e.category)}">
+        <div class="chead"><span class="chip ${cls}">${label}</span>${trap}
+          <span class="fname">${esc(e.feature_name)}</span></div>
+        <p class="hyp">${esc(e.hypothesis)}</p>
+        <div class="meta">${tags}</div>
+        <p class="verdict"><strong>verdict:</strong> ${esc(e.reason||"—")}${deltaLine}</p>
+        ${why?`<details><summary>why — audit trail</summary><ul>${why}</ul></details>`:""}
+      </div>`;
+    }).join("");
+    return `<div class="round"><div class="rhead"><span class="rn">Round ${esc(r)}</span></div><div class="cards">${cards}</div></div>`;
+  }).join("");
+}
+
+tick();
+setInterval(tick, 3000);
+</script>
+</body>
+</html>

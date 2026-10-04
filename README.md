@@ -1,4 +1,4 @@
-# Feature Scientist — Harness + Science Loop + Judgment Layer (Days 1–6)
+# Feature Scientist — Harness + Science Loop + Judgment Layer + Arena UI (Days 1–8)
 
 An autonomous "AI Feature Scientist" agent for the Meta global AI hackathon:
 given a model and an objective, it figures out **what information the model is
@@ -166,3 +166,34 @@ The loop doesn't just measure lift — it judges *how* a feature earns it.
   future-built table) and a *budget-buster* (full-user-history scan with
   real signal but 25 units of serving cost), so the "rejection" demo
   moments are guaranteed.
+
+## Arena UI (Days 7–8)
+
+A demo-ready live dashboard — **stdlib only, zero new dependencies**
+(`src/arena.py` + `src/arena_ui.html`).
+
+```bash
+python3 src/arena.py            # stdlib http.server, default http://localhost:8765
+```
+
+- `/` — dark-themed dashboard: header (baseline AUC, best ΔAUC, live status),
+  accepted-features leaderboard, and a round-by-round experiment timeline.
+  Rejections get visual emphasis — the catches (liar, budget-buster, raw IMDb
+  rating) pop with 🚨/💸 chips and an expandable audit trail.
+- `/api/ledger` — ledger entries with a computed `category`
+  (`accepted` | `rejected:leakage` | `rejected:cost` | `rejected:no-lift`).
+- `/api/summary` — baseline AUC, best delta, verdict counts, rounds.
+- The page polls every 3s and re-renders on change; a missing/empty ledger
+  shows a "waiting for first run" state instead of breaking.
+
+**Two-window demo recipe:**
+
+```bash
+# terminal 1 — the dashboard
+python3 src/arena.py            # open http://localhost:8765
+# terminal 2 — the agent (needs the venv for torch/sklearn)
+.venv/bin/python src/run_scientist.py --rounds 4
+```
+
+Watch hypotheses appear live: acceptances climb the leaderboard while the
+leakage liar and the budget-buster get caught on camera.
