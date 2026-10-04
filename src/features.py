@@ -43,6 +43,13 @@ class Feature:
     #   "all_time"    - reads aggregates that include data NEWER than the
     #                   prediction time  -> TEMPORAL LEAKAGE, must be rejected
     provenance: dict = field(default_factory=dict)
+    # Serving pattern powers the Day 5-6 cost verdict (serving_cost.py):
+    #   "row_local"    - pure function of the scored row (0.5 units)
+    #   "lookup"       - O(1) precomputed key lookup (1.0 units)
+    #   "history_scan" - full event-history scan per request (25.0 units)
+    #   "external"     - outside network call per request (60.0 units)
+    serving: str = "lookup"
+    serving_notes: str = ""
 
 
 @dataclass

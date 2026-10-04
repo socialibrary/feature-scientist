@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 
 from features import Feature, FeatureRegistry
+from traps import build_sneaky_movie_mean, build_user_history_entropy
 
 # ---------------------------------------------------------------------------
 # Data catalog: what the agent is allowed to reason about.
@@ -167,6 +168,8 @@ def build_movie_velocity_30d(ctx) -> Feature:
         provenance={"sources": ["ml1m_ratings"], "temporal_scope": "pit_correct", "tower": "movie",
                     "reads": "train-period ratings with ts in [row_ts-30d, row_ts)",
                     "ctx_keys": ["movie_events"]},
+        serving="history_scan",
+        serving_notes="30d as-of window needs the movie event stream at request time",
     )
 
 
@@ -191,6 +194,8 @@ def build_user_recency_30d(ctx) -> Feature:
         provenance={"sources": ["ml1m_ratings"], "temporal_scope": "pit_correct", "tower": "user",
                     "reads": "train-period ratings with ts in [row_ts-30d, row_ts)",
                     "ctx_keys": ["user_events"]},
+        serving="history_scan",
+        serving_notes="30d as-of window needs the user event stream at request time",
     )
 
 
@@ -223,6 +228,8 @@ def build_user_genre_affinity(ctx) -> Feature:
                     "temporal_scope": "train_only", "tower": "wide",
                     "reads": "user x genre like-rate table built from train rows only",
                     "ctx_keys": ["user_genre_rate"]},
+        serving="lookup",
+        serving_notes="precomputed user x genre table, O(1) by (user_id, genre)",
     )
 
 
@@ -268,6 +275,8 @@ def build_director_track_record_pit(ctx) -> Feature:
                     "temporal_scope": "pit_correct", "tower": "movie",
                     "reads": "train ratings of director's movies with release_ts < row_ts",
                     "ctx_keys": ["director_prefix", "movie_to_director"]},
+        serving="lookup",
+        serving_notes="precomputable per (director, month); O(1) at request time",
     )
 
 
@@ -292,6 +301,8 @@ def build_movie_age_days(ctx) -> Feature:
                     "temporal_scope": "static", "tower": "movie",
                     "reads": "release year only (time-invariant)",
                     "ctx_keys": ["movie_release_ts"]},
+        serving="row_local",
+        serving_notes="timestamp minus release_ts; pure row function",
     )
 
 
@@ -439,6 +450,8 @@ class RuleBasedEngine(HypothesisEngine):
     Round 1: behavioral momentum + taste signals (internal data).
     Round 2: cold-start via IMDb (PIT-correct director signal) + the IMDb trap.
     Round 3: recency + the all-time-mean trap.
+    Round 4: judgment layer -- legit movie_age_days + the liar trap + the
+        budget-buster trap (see traps.py).
     """
 
     _SCHEDULE = {
@@ -477,6 +490,22 @@ class RuleBasedEngine(HypothesisEngine):
              "overall mean -- computed over the complete dataset for maximum "
              "statistical power.",
              ["ml1m_ratings"], build_movie_mean_rating_all, True),
+        ],
+        # Round 4 (Days 5-6, judgment layer): one legit feature plus the two
+        # new demo traps -- the liar and the budget-buster (see traps.py).
+        4: [
+            ("movie_age_days",
+             "Novelty decays: a movie's age at prediction time should shift "
+             "its like-rate. Time-invariant metadata, cheap to serve.",
+             ["imdb_enrichment", "ml1m_movies"], build_movie_age_days, False),
+            ("sneaky_movie_mean_pit",
+             "An as-of movie mean rating should be a strong predictor -- "
+             "computed point-in-time-correct per row.",
+             ["ml1m_ratings"], build_sneaky_movie_mean, True),
+            ("user_history_entropy",
+             "Rater behavior matters: the entropy of a user's rating history "
+             "captures how discriminating they are, which shifts P(liked).",
+             ["ml1m_ratings"], build_user_history_entropy, True),
         ],
     }
 

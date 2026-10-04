@@ -34,7 +34,8 @@ def load_entries(path: str = LEDGER_PATH) -> list[dict]:
 
 
 def build_entry(round_no: int, hypothesis, feature, audit_result,
-                metrics: dict | None, verdict: str, reason: str) -> dict:
+                cost_verdict, metrics: dict | None, verdict: str,
+                reason: str) -> dict:
     try:
         code = inspect.getsource(feature.compute)
     except (OSError, TypeError):
@@ -46,11 +47,17 @@ def build_entry(round_no: int, hypothesis, feature, audit_result,
         "feature_code": code,
         "sources": hypothesis.sources,
         "temporal_scope": (feature.provenance or {}).get("temporal_scope"),
+        "serving": getattr(feature, "serving", "lookup"),
         "trap": bool(hypothesis.trap),
         "leakage_audit": {
             "passed": audit_result.passed,
             "reasons": audit_result.reasons,
         },
+        "serving_cost": ({
+            "passed": cost_verdict.passed,
+            "units": cost_verdict.units,
+            "reasons": cost_verdict.reasons,
+        } if cost_verdict is not None else None),
         "metrics": metrics,
         "verdict": verdict,   # accepted | rejected
         "reason": reason,

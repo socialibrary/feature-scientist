@@ -1,4 +1,4 @@
-# Feature Scientist — ML Harness + Science Loop (Days 1–4)
+# Feature Scientist — Harness + Science Loop + Judgment Layer (Days 1–6)
 
 An autonomous "AI Feature Scientist" agent for the Meta global AI hackathon:
 given a model and an objective, it figures out **what information the model is
@@ -93,7 +93,8 @@ docs/imdb_join.md  # IMDb join method, hit rate, temporal caveat
 ## The science loop (Days 3–4)
 
 ```
-error slices -> propose -> build -> leakage audit -> ablate -> ledger
+error slices -> propose -> build -> leakage audit -> serving-cost check
+    -> ablate -> ledger
 ```
 
 1. **Error slices** (`error_analysis.py`): where does the baseline fail?
@@ -104,31 +105,64 @@ error slices -> propose -> build -> leakage audit -> ablate -> ledger
    v1 **data catalog** (ml-1m + IMDb). `LLMEngine` is a stub marking the
    Meta Model API seam (`META_MODEL_API_URL` / `META_MODEL_API_KEY`).
 3. **Build**: each hypothesis becomes an executable `Feature`,
-   auto-registered with a `point_in_time` declaration and a `provenance`
+   auto-registered with a `point_in_time` declaration, a `provenance`
    record (`temporal_scope`: `train_only` | `pit_correct` | `static` |
-   `all_time`). Two deliberate leakage traps are planted so the demo can
-   show the audit catching them.
-4. **Leakage audit** (`leakage.py`): rejects anything with `all_time`
-   scope or future-built ctx tables — before any training time is spent.
-5. **Ablate** (`ablation.py`): survivors are routed to the right tower
+   `all_time`), and a `serving` pattern (`row_local` | `lookup` |
+   `history_scan` | `external`).
+4. **Leakage audit** (`leakage.py`, hardened Day 5–6): declaration checks
+   PLUS static inspection of the feature's actual code (AST + closure
+   variables). Catches features that *lie* in their provenance — e.g. a
+   "point-in-time" claim whose code closes over a future-built table.
+5. **Serving-cost check** (`serving_cost.py`, new Day 5–6): every feature
+   gets a latency estimate in ms-equivalents from its serving pattern;
+   per-feature budget 8.0 units, cumulative budget 15.0. Expensive
+   features are rejected before any training time is spent.
+6. **Ablate** (`ablation.py`): survivors are routed to the right tower
    (`user`/`movie`/`wide`) and the two-tower retrains on the temporal split
    (`--model lgbm` keeps the original flat-matrix path); accept iff AUC
    lift >= 0.0005.
-6. **Ledger** (`ledger.py`): every hypothesis lands in
-   `results/experiments.jsonl` with its code, audit, metrics, and verdict.
+7. **Ledger** (`ledger.py`): every hypothesis lands in
+   `results/experiments.jsonl` with its code, leakage audit, serving-cost
+   verdict, metrics, and final verdict.
+
+## The judgment layer (Days 5–6)
+
+The loop doesn't just measure lift — it judges *how* a feature earns it.
+
+- **Verify, don't trust** (`leakage.py`): the audit parses each feature's
+  `compute()` source (AST) and inspects its closure variables against a
+  registry of known-dangerous sources (`movie_mean_all`,
+  `imdb_averageRating`/`imdb_numVotes`, …). A feature is rejected if its
+  code touches a dangerous source or reads rows newer than prediction
+  time — regardless of what its declaration claims. Demo trap:
+  `sneaky_movie_mean_pit` in `src/traps.py` declares `pit_correct` while
+  closing over the future-built table; the audit catches the lie twice
+  (closure identity + missing temporal guard).
+- **Cost verdict** (`serving_cost.py`): declared serving patterns map to
+  latency units; the verdict pipeline is leakage → cost → ablation. Demo
+  trap: a full-user-history scan with genuine signal but 25 units of cost
+  dies at the budget gate (`src/traps.py`).
 
 ## Key design decisions (for the demo)
 
 - **Temporal discipline is load-bearing.** The split guarantees no validation
-  row predates any train row. The Day 5–6 leakage detector relies on this: any
-  feature that peeks past a row's prediction time gets rejected on camera.
+  row predates any train row. The leakage detector relies on this: any
+  feature that peeks past a row's prediction time gets rejected on camera —
+  and since Day 5–6 the audit verifies the feature's *code*, not just its
+  declaration.
 - **Train-period-only aggregates.** `user_mean_rating`, `movie_mean_rating`,
   etc. are computed from train rows alone and mapped onto validation rows
   (unseen ids → global fallback). This is the pattern every agent-invented
   feature must follow.
 - **`point_in_time` declarations.** Every registered feature declares which
   timestamp column bounds the data it may read (`src/features.py`). The
-  leakage checker will audit these declarations.
-- **Planted traps (coming Day 5–6):** a leaky feature (movie mean rating over
-  *all* data including the future — looks great, must be rejected) and an
-  expensive-to-serve feature, so the "rejection" demo moments are guaranteed.
+  leakage checker audits these declarations *and* inspects the
+  implementation for violations.
+- **Serving budget.** Every feature declares how it would be served
+  (`row_local`/`lookup`/`history_scan`/`external`); the pipeline rejects
+  unaffordable features before training (`src/serving_cost.py`).
+- **Planted traps (demo fixtures in `src/traps.py`):** a *lying* feature
+  (`sneaky_movie_mean_pit`: claims point-in-time-correct, code reads the
+  future-built table) and a *budget-buster* (full-user-history scan with
+  real signal but 25 units of serving cost), so the "rejection" demo
+  moments are guaranteed.

@@ -3,12 +3,13 @@
   python src/run_scientist.py --rounds 3 [--engine rule|llm]
 
 Each round: propose hypotheses -> build executable features -> leakage audit
--> ablate survivors -> ledger verdict. Prints a summary table at the end.
+-> serving-cost check -> ablate survivors -> ledger verdict. Prints a summary
+table at the end.
 
-A feature is ACCEPTED only if it passes the leakage audit AND lifts
-validation AUC by >= ACCEPT_DELTA_AUC. Everything else is rejected with a
-reason -- including the planted leakage traps, which die at the audit step
-before wasting any training time.
+A feature is ACCEPTED only if it passes the leakage audit, fits the serving
+budget, AND lifts validation AUC by >= ACCEPT_DELTA_AUC. Everything else is
+rejected with a reason -- including the planted traps, which die at the audit
+or cost step before wasting any training time.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from features import FeatureRegistry
 from leakage import audit_feature
 from ledger import append_entry, build_entry, load_entries
 from scientist import DATA_CATALOG, build_ctx, get_engine
+from serving_cost import MAX_TOTAL_UNITS, check_budget
 from two_tower import RESULTS_PATH as TORCH_RESULTS_PATH
 
 ACCEPT_DELTA_AUC = 0.0005
@@ -69,6 +71,7 @@ def run(rounds: int, engine_name: str, model_backend: str = "torch") -> list[dic
 
     registry = FeatureRegistry()
     ledger_entries: list[dict] = []
+    accepted_cost_units = 0.0  # cumulative serving budget of accepted features
 
     # --- rounds ------------------------------------------------------------
     for r in range(1, rounds + 1):
@@ -94,29 +97,40 @@ def run(rounds: int, engine_name: str, model_backend: str = "torch") -> list[dic
             audit = audit_feature(feature, ctx, valid)
             print(f"   leakage audit: {audit}")
             metrics = None
+            cost = None
             if not audit.passed:
                 verdict, reason = "rejected", \
                     "leakage: " + "; ".join(audit.reasons)
                 print(f"   verdict: REJECTED ({reason})")
             else:
-                print("   ablating (baseline + feature)...")
-                metrics = ablate(train, valid, stats, feature, ctx,
-                                 base_auc, base_ll, prep=prep,
-                                 X_train_base=X_train_base,
-                                 X_valid_base=X_valid_base,
-                                 model=model_backend)
-                print(f"   ablation: AUC={metrics['auc']:.4f} "
-                      f"(delta {metrics['delta_auc']:+.4f}), "
-                      f"logloss={metrics['log_loss']:.4f}")
-                if metrics["delta_auc"] >= ACCEPT_DELTA_AUC:
-                    verdict = "accepted"
-                    reason = f"AUC lift {metrics['delta_auc']:+.4f} >= {ACCEPT_DELTA_AUC}"
-                else:
+                cost = check_budget(feature, accepted_cost_units)
+                print(f"   serving cost: {cost}")
+                if not cost.passed:
                     verdict, reason = "rejected", \
-                        f"no lift (delta {metrics['delta_auc']:+.4f} < {ACCEPT_DELTA_AUC})"
-                print(f"   verdict: {verdict.upper()} ({reason})")
+                        "serving cost: " + "; ".join(cost.reasons)
+                    print(f"   verdict: REJECTED ({reason})")
+                else:
+                    print("   ablating (baseline + feature)...")
+                    metrics = ablate(train, valid, stats, feature, ctx,
+                                     base_auc, base_ll, prep=prep,
+                                     X_train_base=X_train_base,
+                                     X_valid_base=X_valid_base,
+                                     model=model_backend)
+                    print(f"   ablation: AUC={metrics['auc']:.4f} "
+                          f"(delta {metrics['delta_auc']:+.4f}), "
+                          f"logloss={metrics['log_loss']:.4f}")
+                    if metrics["delta_auc"] >= ACCEPT_DELTA_AUC:
+                        verdict = "accepted"
+                        reason = (f"AUC lift {metrics['delta_auc']:+.4f} >= "
+                                  f"{ACCEPT_DELTA_AUC}")
+                        accepted_cost_units = cost.new_total_units
+                    else:
+                        verdict, reason = "rejected", \
+                            f"no lift (delta {metrics['delta_auc']:+.4f} < {ACCEPT_DELTA_AUC})"
+                    print(f"   verdict: {verdict.upper()} ({reason})")
 
-            entry = build_entry(r, h, feature, audit, metrics, verdict, reason)
+            entry = build_entry(r, h, feature, audit, cost, metrics,
+                                verdict, reason)
             append_entry(entry)
             ledger_entries.append(entry)
 
