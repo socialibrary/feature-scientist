@@ -94,9 +94,13 @@ def _bucketize(values: pd.Series, n_buckets: int = 10) -> pd.Series:
         cats = pd.qcut(vv, q=n_buckets, duplicates="drop")
         nq = len(cats.cat.categories)
         bounds = [(iv.left, iv.right) for iv in cats.cat.categories]
-        codes = cats.cat.codes.to_numpy()
+        # codes aligned to the FULL index (missing rows -> -1, never
+        # selected); the old code mixed non-missing-length codes with
+        # full-length masks and crashed on any NaN-bearing candidate.
+        full_codes = pd.Series(-1, index=v.index)
+        full_codes.loc[vv.index] = cats.cat.codes.to_numpy()
         for i, (l, r) in enumerate(bounds):
-            labels[(~is_missing) & (codes == i)] = \
+            labels[full_codes == i] = \
                 f"[{l:.3g}, {r:.3g}) ({_ordinal_name(i, nq)})"
         return labels
 

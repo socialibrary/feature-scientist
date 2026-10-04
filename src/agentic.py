@@ -19,6 +19,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from baseline import TARGET
 from ablation import ablate
 from codegen import (CodegenError, materialize_feature, parse_llm_response,
                      smoke_test)
@@ -70,6 +71,13 @@ def _materialize_or_fail(spec, ctx, train):
     except Exception as e:  # noqa: BLE001 - generated code, anything can happen
         return None, f"smoke test raised {type(e).__name__}: {e}"
     return feature, None
+
+
+def _is_duplicate(run_ctx: dict, feature) -> bool:
+    """Brief mode: has this feature already been accepted? Checked after
+    EVERY materialization -- a revision can converge onto an accepted name."""
+    return bool(run_ctx.get("skip_accepted")) and feature is not None and \
+        feature.name in run_ctx.get("accepted_names", set())
 
 
 def process_agentic(r: int, h, run_ctx: dict) -> tuple[dict, float]:
@@ -129,35 +137,45 @@ def process_agentic(r: int, h, run_ctx: dict) -> tuple[dict, float]:
         print(f"   built feature '{feature.name}' "
               f"(scope={feature.provenance.get('temporal_scope')}, "
               f"serving={feature.serving})")
+        if _is_duplicate(run_ctx, feature):
+            verdict, reason = "duplicate", \
+                "already accepted in an earlier round; not re-ablated"
+            print(f"   verdict: DUPLICATE ({reason})")
 
-        # ---- 3. leakage audit, with ONE revision on reject ---------------
-        audit = audit_feature(feature, ctx, valid)
-        print(f"   leakage audit: {audit}")
-        agentic["attempts"].append(
-            {"stage": "audit", "passed": audit.passed,
-             "reasons": list(audit.reasons)})
-        if not audit.passed:
-            fb = "leakage audit rejected: " + "; ".join(audit.reasons)
-            old_name = spec.get("name")
-            try:
-                spec = revise_with_feedback(spec, "leakage audit", fb,
-                                            backend, ctx_meta)
-                agentic["revisions"].append(
-                    {"stage": "audit", "feedback": fb,
-                     "from": old_name, "to": spec.get("name"),
-                     "code": spec.get("code", "")})
-                print(f"   revised after audit -> '{spec.get('name')}'")
-                feature, err = _materialize_or_fail(spec, ctx, train)
-                if err:
-                    verdict, reason = "rejected", err
-                else:
-                    audit = audit_feature(feature, ctx, valid)
-                    print(f"   re-audit: {audit}")
-                    agentic["attempts"].append(
-                        {"stage": "audit-retry", "passed": audit.passed,
-                         "reasons": list(audit.reasons)})
-            except (LLMError, CodegenError) as e:
-                verdict, reason = "rejected", f"revision failed: {e}"
+
+        if verdict is None:
+            # ---- 3. leakage audit, with ONE revision on reject ---------------
+            audit = audit_feature(feature, ctx, valid)
+            print(f"   leakage audit: {audit}")
+            agentic["attempts"].append(
+                {"stage": "audit", "passed": audit.passed,
+                 "reasons": list(audit.reasons)})
+            if not audit.passed:
+                fb = "leakage audit rejected: " + "; ".join(audit.reasons)
+                old_name = spec.get("name")
+                try:
+                    spec = revise_with_feedback(spec, "leakage audit", fb,
+                                                backend, ctx_meta)
+                    agentic["revisions"].append(
+                        {"stage": "audit", "feedback": fb,
+                         "from": old_name, "to": spec.get("name"),
+                         "code": spec.get("code", "")})
+                    print(f"   revised after audit -> '{spec.get('name')}'")
+                    feature, err = _materialize_or_fail(spec, ctx, train)
+                    if err:
+                        verdict, reason = "rejected", err
+                    elif _is_duplicate(run_ctx, feature):
+                        verdict, reason = "duplicate", \
+                            "already accepted in an earlier round; not re-ablated"
+                        print(f"   verdict: DUPLICATE ({reason})")
+                    else:
+                        audit = audit_feature(feature, ctx, valid)
+                        print(f"   re-audit: {audit}")
+                        agentic["attempts"].append(
+                            {"stage": "audit-retry", "passed": audit.passed,
+                             "reasons": list(audit.reasons)})
+                except (LLMError, CodegenError) as e:
+                    verdict, reason = "rejected", f"revision failed: {e}"
 
         # ---- 4. serving-cost check, with ONE revision on reject ----------
         if verdict is None and audit is not None and audit.passed:
@@ -180,6 +198,10 @@ def process_agentic(r: int, h, run_ctx: dict) -> tuple[dict, float]:
                     feature, err = _materialize_or_fail(spec, ctx, train)
                     if err:
                         verdict, reason = "rejected", err
+                    elif _is_duplicate(run_ctx, feature):
+                        verdict, reason = "duplicate", \
+                            "already accepted in an earlier round; not re-ablated"
+                        print(f"   verdict: DUPLICATE ({reason})")
                     else:
                         # A revision can introduce new leakage: re-audit.
                         audit = audit_feature(feature, ctx, valid)
@@ -196,6 +218,25 @@ def process_agentic(r: int, h, run_ctx: dict) -> tuple[dict, float]:
                                  "reasons": list(cost.reasons)})
                 except (LLMError, CodegenError) as e:
                     verdict, reason = "rejected", f"revision failed: {e}"
+
+        # ---- 5a. calibration screen gate (brief mode): ablate only
+        # significant miscalibrations; the rest never cost a training run.
+        if (run_ctx.get("calibration_screen")
+                and run_ctx.get("proba") is not None
+                and verdict is None and audit is not None and audit.passed
+                and cost is not None and cost.passed):
+            from calibration import calibration_screen as _screen
+            vals = feature.compute(valid, ctx)
+            scr = _screen(valid[TARGET].to_numpy(), run_ctx["proba"],
+                          vals, feature.name)
+            print(f"   calibration screen: {scr['summary']}")
+            agentic["attempts"].append(
+                {"stage": "screen", "verdict": scr["verdict"],
+                 "summary": scr["summary"]})
+            if scr["verdict"] != "signal":
+                verdict, reason = "screened_out", \
+                    "calibration screen: " + scr["summary"]
+                print(f"   verdict: SCREENED OUT ({reason})")
 
         # ---- 5. ablate survivors ------------------------------------------
         if (verdict is None and audit is not None and audit.passed
@@ -218,6 +259,9 @@ def process_agentic(r: int, h, run_ctx: dict) -> tuple[dict, float]:
                 reason = (f"AUC lift {metrics['delta_auc']:+.4f} >= "
                           f"{accept_delta}")
                 run_ctx["accepted_cost_units"] = cost.new_total_units
+                _an = run_ctx.get("accepted_names")
+                if _an is not None:
+                    _an.add(feature.name)
             else:
                 verdict, reason = "rejected", (
                     f"no lift (delta {metrics['delta_auc']:+.4f} < "
@@ -238,7 +282,8 @@ def process_agentic(r: int, h, run_ctx: dict) -> tuple[dict, float]:
     # ---- 6. ledger ----------------------------------------------------------
     if feature is not None:
         entry = build_entry(r, h, feature, audit, cost, metrics,
-                            verdict, reason, agentic=agentic)
+                            verdict, reason, agentic=agentic,
+                            brief=run_ctx.get("brief_stamp"))
         # build_entry can't inspect.getsource an exec'd function reliably;
         # the exact generated code is authoritative.
         entry["feature_code"] = spec.get("code", entry.get("feature_code"))

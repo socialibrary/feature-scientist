@@ -532,7 +532,8 @@ class LLMEngine(HypothesisEngine):
     ablation. The LLM's freedom is checked by machinery at every step.
     """
 
-    def __init__(self, backend: str | None = None):
+    def __init__(self, backend: str | None = None,
+                 problem_context: dict | None = None):
         from llm_backend import HTTPBackend, ScriptedBackend
         be = backend or os.environ.get("FS_LLM_BACKEND", "http")
         if be == "scripted":
@@ -541,16 +542,47 @@ class LLMEngine(HypothesisEngine):
             self.backend = HTTPBackend()
         else:
             raise ValueError(f"unknown LLM backend: {be!r}")
+        # Brief-driven runs: the problem statement + temporal contract.
+        # The contract is load-bearing: it is quoted into every prompt and
+        # the deterministic audit enforces each feature's PIT declaration
+        # against it.
+        self.problem_context = problem_context or {}
 
     def is_live(self) -> bool:
         return self.backend.configured
+
+    def _problem_block(self) -> str:
+        pc = self.problem_context
+        if not pc:
+            return ""
+        gaps = pc.get("calibration_gaps") or []
+        gap_lines = "\n".join(f"- {g}" for g in gaps)
+        return (
+            "Problem brief (from the user's brief YAML):\n"
+            f"- problem: {pc.get('problem', '(not stated)')}\n"
+            f"- label: {pc.get('label', '(not stated)')}\n"
+            f"- TEMPORAL CONTRACT (load-bearing): "
+            f"{pc.get('prediction_time', '(not stated)')}\n"
+            "  Every feature you propose MUST declare point_in_time honestly "
+            "against this contract, and the code must only read source data "
+            "at or before the prediction time. The deterministic audit "
+            "enforces the declaration against the actual code and WILL "
+            "reject anything that reads the future.\n"
+            + (f"\nCalibration screen (baseline miscalibration by candidate "
+                 f"signal; positive gap = model under-predicts the segment):\n"
+                 f"{gap_lines}\n"
+                 "Propose features that explain the largest significant gaps. "
+                 "Prefer segments the model systematically under-predicts.\n"
+               if gaps else "")
+        )
 
     def _build_prompt(self, error_slices: dict, catalog: dict,
                       round_no: int) -> str:
         import json as _json
         worst = error_slices.get("worst", [])[:5]
         return (
-            "You are a feature-discovery scientist for a movie recommender "
+            self._problem_block()
+            + "You are a feature-discovery scientist for a movie recommender "
             "(MovieLens-1M: 1M ratings, 6k users, 3.9k movies). "
             "Two-tower baseline AUC 0.7410. Propose exactly 2 falsifiable "
             "hypotheses about what INFORMATION the model is missing -- not "
@@ -647,9 +679,10 @@ Tower routing (declare one): "user" (user-side signal), "movie" (movie-side
 signal), "wide" (user×movie interaction)."""
 
 
-def get_engine(name: str, backend: str = "http") -> HypothesisEngine:
+def get_engine(name: str, backend: str = "http",
+               problem_context: dict | None = None) -> HypothesisEngine:
     if name == "rule":
         return RuleBasedEngine()
     if name == "llm":
-        return LLMEngine(backend=backend)
+        return LLMEngine(backend=backend, problem_context=problem_context)
     raise ValueError(f"unknown engine: {name}")

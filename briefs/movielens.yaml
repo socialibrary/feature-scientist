@@ -1,0 +1,33 @@
+# Feature Scientist brief: MovieLens-1M demo.
+#
+# The input to the agent is a prompt: an ML problem in plain language plus
+# the datasets as free-form schema text (paste a Hive table dump here).
+# The agent profiles the actual tables ("text describes, data verifies"),
+# then runs: error slices -> calibration screen -> propose -> critic ->
+# leakage audit -> cost gate -> calibration screen -> ablate, stopping when
+# no candidate shows a significant calibration gap, max_rounds is hit, or
+# the serving budget is exhausted.
+#
+# Run:  python3 src/brief.py briefs/movielens.yaml
+#         (scripted LLM backend by default: no keys, no network)
+
+problem: "predict P(user likes movie) for ranking"
+label: "liked = rating >= 4, observed at rating timestamp"
+prediction_time: "score at impression time T; features may only use data with timestamp <= T"
+
+tables:
+  - name: ratings
+    schema_text: "user_id INT, movie_id INT, rating INT (1-5), timestamp BIGINT -- 1,000,209 rows, 2000-04 to 2001-02"
+  - name: users
+    schema_text: "user_id INT, gender STRING, age INT (bucket code), occupation INT (coded 0-20), zip STRING -- 6,040 rows, static demographics"
+  - name: movies
+    schema_text: "movie_id INT, title STRING (with release year), genres STRING (pipe-separated) -- ~3,900 rows"
+  - name: imdb_enrichment
+    schema_text: "movieId INT, tconst STRING, startYear FLOAT, runtimeMinutes FLOAT, directors STRING, imdb_averageRating FLOAT (ALL-TIME aggregate, leakage if used raw), imdb_numVotes FLOAT (ALL-TIME, leakage if used raw) -- 86% of movies"
+
+engine: llm
+backend: scripted
+model: torch
+
+serving: {per_feature_budget: 8, total_budget: 15}
+stop_when: {max_rounds: 3, stop_on_no_signal: true}

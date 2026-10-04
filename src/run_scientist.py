@@ -37,7 +37,33 @@ ACCEPT_DELTA_AUC = 0.0005
 
 
 def run(rounds: int, engine_name: str, model_backend: str = "torch",
-        llm_backend: str = "http") -> list[dict]:
+        llm_backend: str = "http",
+        calibration_screen: bool = False,
+        screen_battery_fn=None,
+        stop_on_no_signal: bool = False,
+        problem: dict | None = None,
+        skip_accepted: bool = False,
+        catalog: dict | None = None) -> list[dict]:
+    """The science loop.
+
+    The extra kwargs are the brief-driven mode (src/brief.py); all default
+    to off so the classic paths (--rounds N, --engine llm --backend
+    scripted) behave exactly as before:
+      calibration_screen - gate each surviving candidate through the
+        calibration screen before ablation; non-signals are "screened_out"
+        without spending a training run (docs/calibration_integration.md).
+      screen_battery_fn  - (ctx, train, valid, stats, proba) -> [summaries];
+        cheap pre-loop screen whose significant gaps guide proposing.
+      stop_on_no_signal  - stop after a round with no significant
+        calibration gap (the screen as convergence criterion).
+      problem            - brief dict (problem/label/prediction_time/...);
+        threaded into the LLM prompt and stamped on ledger entries.
+      skip_accepted      - don't re-ablate already-accepted features.
+      catalog            - data catalog for the engine (default DATA_CATALOG).
+    """
+    from serving_cost import MAX_TOTAL_UNITS
+    cat = catalog if catalog is not None else DATA_CATALOG
+    problem = dict(problem or {})
     # --- one-time setup: data, baseline model, error slices, ctx -----------
     train, valid, stats, model_info, proba, cutoff_ts = \
         train_baseline_predict(model_backend)
@@ -66,8 +92,28 @@ def run(rounds: int, engine_name: str, model_backend: str = "torch",
         X_train_base = featurize(train, stats)
         X_valid_base = featurize(valid, stats)
 
+    # --- calibration battery: cheap pre-loop screen (no training) ----------
+    # Its significant gaps guide proposing (they become part of the LLM
+    # prompt); with stop_on_no_signal, an empty battery stops the run
+    # before round 1 -- the screen as convergence criterion.
+    if screen_battery_fn is not None:
+        print("\nrunning calibration screen battery (no training)...")
+        battery_summaries = screen_battery_fn(ctx, train, valid, stats,
+                                              proba)
+        for s in battery_summaries:
+            print(f"  - {s}")
+        if not battery_summaries:
+            print("battery found no significant calibration gaps.")
+        problem = {**problem, "calibration_gaps": battery_summaries}
+        if stop_on_no_signal and not battery_summaries:
+            print("STOPPING before round 1: no significant calibration "
+                  "gaps remain.")
+            return []
+
     try:
-        engine = get_engine(engine_name, backend=llm_backend)
+        engine = get_engine(engine_name, backend=llm_backend,
+                            problem_context=problem if engine_name == "llm"
+                            else None)
     except ValueError as e:
         print(e)
         sys.exit(2)
@@ -84,28 +130,40 @@ def run(rounds: int, engine_name: str, model_backend: str = "torch",
     registry = FeatureRegistry()
     ledger_entries: list[dict] = []
     accepted_cost_units = 0.0  # cumulative serving budget of accepted features
+    accepted_names: set[str] = set()  # brief mode: skip re-ablating these
+    brief_stamp = None
+    if problem:
+        brief_stamp = {k: problem[k] for k in ("problem", "label",
+                                               "prediction_time")
+                       if k in problem} or None
 
     # --- rounds ------------------------------------------------------------
     for r in range(1, rounds + 1):
         print(f"\n{'=' * 60}\nROUND {r}\n{'=' * 60}")
         try:
-            hypotheses = engine.propose(slices, DATA_CATALOG, r)
+            hypotheses = engine.propose(slices, cat, r)
         except (NotImplementedError, LLMNotConfiguredError) as e:
             print(f"engine unavailable: {e}\nfalling back to RuleBasedEngine")
-            hypotheses = get_engine("rule").propose(slices, DATA_CATALOG, r)
+            hypotheses = get_engine("rule").propose(slices, cat, r)
             agentic = False
 
         if not hypotheses:
             print("no hypotheses proposed this round.")
             continue
 
+        round_had_signal = False  # any significant calibration gap?
+        round_had_fresh = False  # any non-duplicate hypothesis?
         run_ctx = {
             "ctx": ctx, "train": train, "valid": valid, "stats": stats,
-            "base_auc": base_auc, "base_ll": base_ll,
+            "base_auc": base_auc, "base_ll": base_ll, "proba": proba,
             "prep": prep, "X_train_base": X_train_base,
             "X_valid_base": X_valid_base, "model_backend": model_backend,
             "engine": engine, "accepted_cost_units": accepted_cost_units,
+            "accepted_names": accepted_names,
             "accept_delta": ACCEPT_DELTA_AUC,
+            "calibration_screen": calibration_screen,
+            "skip_accepted": skip_accepted,
+            "brief_stamp": brief_stamp,
         }
         for h in hypotheses:
             if agentic and getattr(h, "llm_spec", None):
@@ -113,6 +171,12 @@ def run(rounds: int, engine_name: str, model_backend: str = "torch",
                 print(f"   sources: {', '.join(h.sources)}")
                 entry, accepted_cost_units = process_agentic(r, h, run_ctx)
                 run_ctx["accepted_cost_units"] = accepted_cost_units
+                for a in entry.get("agentic", {}).get("attempts", []):
+                    if a.get("stage") == "screen" \
+                            and a.get("verdict") == "signal":
+                        round_had_signal = True
+                if entry.get("verdict") != "duplicate":
+                    round_had_fresh = True
                 ledger_entries.append(entry)
                 continue
             print(f"\n-- hypothesis: {h.text}")
@@ -122,45 +186,83 @@ def run(rounds: int, engine_name: str, model_backend: str = "torch",
             print(f"   built feature '{feature.name}' "
                   f"(scope={feature.provenance.get('temporal_scope')})")
 
-            audit = audit_feature(feature, ctx, valid)
-            print(f"   leakage audit: {audit}")
-            metrics = None
-            cost = None
-            if not audit.passed:
-                verdict, reason = "rejected", \
-                    "leakage: " + "; ".join(audit.reasons)
-                print(f"   verdict: REJECTED ({reason})")
+            audit = cost = metrics = None
+            verdict = reason = None
+            if skip_accepted and feature.name in accepted_names:
+                verdict, reason = "duplicate", \
+                    "already accepted in an earlier round; not re-ablated"
+                print(f"   verdict: DUPLICATE ({reason})")
             else:
-                cost = check_budget(feature, accepted_cost_units)
-                print(f"   serving cost: {cost}")
-                if not cost.passed:
+                round_had_fresh = True
+                audit = audit_feature(feature, ctx, valid)
+                print(f"   leakage audit: {audit}")
+            if verdict is None:
+                if not audit.passed:
                     verdict, reason = "rejected", \
-                        "serving cost: " + "; ".join(cost.reasons)
+                        "leakage: " + "; ".join(audit.reasons)
                     print(f"   verdict: REJECTED ({reason})")
                 else:
-                    print("   ablating (baseline + feature)...")
-                    metrics = ablate(train, valid, stats, feature, ctx,
-                                     base_auc, base_ll, prep=prep,
-                                     X_train_base=X_train_base,
-                                     X_valid_base=X_valid_base,
-                                     model=model_backend)
-                    print(f"   ablation: AUC={metrics['auc']:.4f} "
-                          f"(delta {metrics['delta_auc']:+.4f}), "
-                          f"logloss={metrics['log_loss']:.4f}")
-                    if metrics["delta_auc"] >= ACCEPT_DELTA_AUC:
-                        verdict = "accepted"
-                        reason = (f"AUC lift {metrics['delta_auc']:+.4f} >= "
-                                  f"{ACCEPT_DELTA_AUC}")
-                        accepted_cost_units = cost.new_total_units
-                    else:
+                    cost = check_budget(feature, accepted_cost_units)
+                    print(f"   serving cost: {cost}")
+                    if not cost.passed:
                         verdict, reason = "rejected", \
-                            f"no lift (delta {metrics['delta_auc']:+.4f} < {ACCEPT_DELTA_AUC})"
-                    print(f"   verdict: {verdict.upper()} ({reason})")
+                            "serving cost: " + "; ".join(cost.reasons)
+                        print(f"   verdict: REJECTED ({reason})")
+                    elif calibration_screen:
+                        # Screen gate (docs/calibration_integration.md):
+                        # ablate only significant miscalibrations; the rest
+                        # never cost a training run.
+                        from calibration import calibration_screen as _screen
+                        vals = feature.compute(valid, ctx)
+                        scr = _screen(valid[TARGET].to_numpy(), proba,
+                                      vals, feature.name)
+                        print(f"   calibration screen: {scr['summary']}")
+                        if scr["verdict"] == "signal":
+                            round_had_signal = True
+                        else:
+                            verdict, reason = "screened_out", \
+                                "calibration screen: " + scr["summary"]
+                            print(f"   verdict: SCREENED OUT ({reason})")
+                    if verdict is None:
+                        print("   ablating (baseline + feature)...")
+                        metrics = ablate(train, valid, stats, feature, ctx,
+                                         base_auc, base_ll, prep=prep,
+                                         X_train_base=X_train_base,
+                                         X_valid_base=X_valid_base,
+                                         model=model_backend)
+                        print(f"   ablation: AUC={metrics['auc']:.4f} "
+                              f"(delta {metrics['delta_auc']:+.4f}), "
+                              f"logloss={metrics['log_loss']:.4f}")
+                        if metrics["delta_auc"] >= ACCEPT_DELTA_AUC:
+                            verdict = "accepted"
+                            reason = (f"AUC lift {metrics['delta_auc']:+.4f} "
+                                      f">= {ACCEPT_DELTA_AUC}")
+                            accepted_cost_units = cost.new_total_units
+                            accepted_names.add(feature.name)
+                        else:
+                            verdict, reason = "rejected", \
+                                f"no lift (delta {metrics['delta_auc']:+.4f} < {ACCEPT_DELTA_AUC})"
+                        print(f"   verdict: {verdict.upper()} ({reason})")
 
             entry = build_entry(r, h, feature, audit, cost, metrics,
-                                verdict, reason)
+                                verdict, reason, brief=brief_stamp)
             append_entry(entry)
             ledger_entries.append(entry)
+
+        # --- stopping rules (brief mode) -----------------------------------
+        if accepted_cost_units >= MAX_TOTAL_UNITS:
+            print(f"\nSTOPPING after round {r}: serving budget exhausted "
+                  f"({accepted_cost_units:.1f}/{MAX_TOTAL_UNITS} units).")
+            break
+        if stop_on_no_signal and hypotheses:
+            if not round_had_fresh:
+                print(f"\nSTOPPING after round {r}: all proposed features "
+                      f"already accepted in earlier rounds.")
+                break
+            if not round_had_signal:
+                print(f"\nSTOPPING after round {r}: no candidate showed a "
+                      f"significant calibration gap.")
+                break
 
     return ledger_entries
 

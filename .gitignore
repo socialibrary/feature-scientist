@@ -4,3 +4,4 @@ __pycache__/
 .DS_Store
 results/
 data/imdb/*.tsv.gz
+src/catalog/profiling.json

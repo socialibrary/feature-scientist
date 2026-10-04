@@ -330,3 +330,64 @@ cd src && ../.venv/bin/python demo_calibration.py
 Integration point (new stage: error analysis → calibration screen →
 ablation): `screen_candidates(y_valid, proba, {name: series})`,
 `format_table(results)`; details in `docs/calibration_integration.md`.
+
+## The brief: point the agent at your own ML problem
+
+`src/brief.py` is the front door. The input is a YAML brief: an ML problem
+in plain language plus the datasets as free-form schema text (paste a Hive
+table dump). The agent profiles the *actual* tables ("text describes, data
+verifies"), then runs the full loop with a stopping rule.
+
+```yaml
+# briefs/movielens.yaml
+problem: "predict P(user likes movie) for ranking"
+label: "liked = rating >= 4, observed at rating timestamp"
+prediction_time: "score at impression time T; features may only use data with timestamp <= T"
+tables:
+  - name: ratings
+    schema_text: "user_id INT, movie_id INT, rating INT, timestamp BIGINT -- 1M rows"
+  - name: imdb_enrichment
+    schema_text: "movieId INT, ... imdb_averageRating FLOAT (ALL-TIME, leakage if raw)"
+engine: llm
+backend: scripted          # no keys, no network
+serving: {per_feature_budget: 8, total_budget: 15}
+stop_when: {max_rounds: 3, stop_on_no_signal: true}
+```
+
+```bash
+.venv/bin/python src/brief.py briefs/movielens.yaml --backend scripted
+```
+
+What happens, in order:
+
+1. **Profile** — row counts, null rates, time ranges, and join-key
+   overlap/coverage per table (e.g. "95.4% of IMDb movieIds hit ratings
+   movies"), written to `src/catalog/profiling.json` and merged into the
+   data-catalog registry format (`load_profiled_catalog()` extends the
+   `DATA_CATALOG` interface with profiling fields; it doesn't fork it).
+2. **Baseline + error slices**, as usual.
+3. **Calibration battery** (no training) — a cheap screen over
+   pre-computable candidate signals (movie age, genre flags, IMDb
+   time-invariant columns, popularity/recency proxies for the sparse IDs).
+   Significant gaps become part of the LLM prompt, at the scale verbal
+   reasoning can actually work with (percentage-point gaps, not +0.0005
+   AUC deltas).
+4. **The loop** — propose → critic → leakage audit → cost gate →
+   calibration screen → ablate. The screen gates ablation: non-signals are
+   `screened_out` without spending a training run.
+5. **Stopping** — the run stops when no candidate shows a significant
+   calibration gap (the screen as convergence criterion), `max_rounds` is
+   hit, or the serving budget is exhausted. Already-accepted features are
+   never re-ablated.
+
+The brief's `prediction_time` is the load-bearing temporal contract: it is
+quoted into every LLM prompt (the model must declare `point_in_time`
+honestly against it), the deterministic audit enforces the declaration
+against the actual code, and the contract is stamped on every ledger entry.
+
+Table loading is behind a `TableSource` abstraction (`name`,
+`schema_text`, `registry_key`, `load() -> pd.DataFrame`); the MovieLens /
+IMDb / Wikidata loaders in `src/brief.py` are one backend — a warehouse
+(Hive/Spark/Trino) backend implements the same interface. The YAML parser
+is stdlib-only (a documented subset: nested maps, lists of maps, inline
+`{k: v}`, comments); JSON briefs are accepted too.
