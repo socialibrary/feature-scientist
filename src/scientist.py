@@ -16,9 +16,15 @@ Engines:
     the worst error slices (momentum, affinity, cold-start, recency...).
     Deliberately includes two tempting-but-leaky hypotheses so the demo can
     show the leakage audit catching them on camera.
-  * LLMEngine - STUB. This is the seam for the Meta Model API on hackathon
-    day: set META_MODEL_API_URL / META_MODEL_API_KEY and implement propose()
-    using _build_prompt(). Raises NotImplementedError until then.
+  * LLMEngine - the real agentic engine. An LLM reasons over the error
+    slices + data catalog (free-form reasoning recorded verbatim in the
+    ledger) and returns structured hypotheses whose `code` becomes
+    executable Features. Backend via FS_LLM_BACKEND: "http" (OpenAI-
+    compatible chat completions from FS_LLM_BASE_URL / FS_LLM_API_KEY /
+    FS_LLM_MODEL) or "scripted" (deterministic offline test double).
+    Every LLM hypothesis runs: critic -> AST safety check -> deterministic
+    leakage audit -> serving-cost gate -> ablation, with ONE revision round
+    after each rejection (see agentic.py).
 """
 
 from __future__ import annotations
@@ -34,40 +40,18 @@ from traps import build_sneaky_movie_mean, build_user_history_entropy
 
 # ---------------------------------------------------------------------------
 # Data catalog: what the agent is allowed to reason about.
+#
+# Now registry-backed (src/catalog/): the same dict shape as the historic
+# literal (description / columns / temporal / note, plus join_keys and
+# column_meta), so existing engines keep working unchanged. Engines that
+# want to *discover* data call search_datasets(query) -- the FTS5 discovery
+# API over the per-column metadata the LLM reasons over.
+# Rebuild the registry with: python3 -m catalog.build_catalog (from src/).
 # ---------------------------------------------------------------------------
 
-DATA_CATALOG = {
-    "ml1m_ratings": {
-        "description": "1,000,209 user-movie ratings with timestamps",
-        "columns": ["user_id", "movie_id", "rating", "timestamp", "liked"],
-        "temporal": True,
-        "note": "Timestamped. Aggregates must be train-period-only or as-of "
-                "each row's prediction time, never all-time.",
-    },
-    "ml1m_users": {
-        "description": "6,040 users: gender, age bucket, occupation, zip",
-        "columns": ["user_id", "gender", "age", "occupation", "zip"],
-        "temporal": False,
-        "note": "Static demographics. Safe to use raw.",
-    },
-    "ml1m_movies": {
-        "description": "~3,900 movies: title (with year), pipe-separated genres",
-        "columns": ["movie_id", "title", "genres"],
-        "temporal": False,
-        "note": "Static metadata. Safe to use raw.",
-    },
-    "imdb_enrichment": {
-        "description": "IMDb join on 86% of movies (94% of ratings)",
-        "columns": ["movieId", "tconst", "primaryTitle", "startYear",
-                    "directors", "runtimeMinutes",
-                    "imdb_averageRating", "imdb_numVotes"],
-        "temporal": "mixed",
-        "note": "imdb_averageRating / imdb_numVotes are ALL-TIME aggregates "
-                "(votes through Oct 2026). Using them raw to score a 2001 "
-                "rating is TEMPORAL LEAKAGE. startYear / runtimeMinutes / "
-                "directors are time-invariant and safe.",
-    },
-}
+from catalog import load_catalog_dict, search_datasets  # noqa: E402
+
+DATA_CATALOG = load_catalog_dict()
 
 IMDB_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "data", "imdb",
@@ -93,6 +77,10 @@ class Hypothesis:
     # engine would propose risky ideas on its own; here we plant two so the
     # audit has something to catch on camera.
     trap: bool = False
+    # LLM-engine extras: the parsed spec dict the model returned, and its
+    # free-form reasoning (recorded verbatim in the ledger).
+    llm_spec: dict = field(default_factory=dict)
+    reasoning: str = ""
 
 
 class HypothesisEngine:
@@ -527,49 +515,141 @@ class RuleBasedEngine(HypothesisEngine):
 
 
 class LLMEngine(HypothesisEngine):
-    """STUB -- seam for the Meta Model API (hackathon day).
+    """Real agentic engine: an LLM reasons over the error slices + data
+    catalog and returns free-form reasoning plus structured hypotheses whose
+    `code` becomes executable Features.
 
-    To activate: set META_MODEL_API_URL and META_MODEL_API_KEY, then
-    implement propose() to POST _build_prompt(...) and parse the returned
-    hypotheses into Hypothesis objects whose .build closures construct
-    Features (the agent writes the builder code; the audit still judges it).
+    Backend selection via FS_LLM_BACKEND (default "http"):
+      * "http"     -> HTTPBackend (FS_LLM_BASE_URL / FS_LLM_API_KEY /
+                      FS_LLM_MODEL). Raises LLMNotConfiguredError when the
+                      key is missing; run_scientist.py falls back to the
+                      rule engine with a clear message.
+      * "scripted" -> ScriptedBackend, deterministic test double (no
+                      network) that stages the demo arcs.
 
-    Until then, RuleBasedEngine is the default. propose() raises
-    NotImplementedError with setup instructions.
+    The hypotheses still go through the full gauntlet: critic -> AST
+    safety check -> deterministic leakage audit -> serving-cost gate ->
+    ablation. The LLM's freedom is checked by machinery at every step.
     """
 
-    def __init__(self):
-        self.url = os.environ.get("META_MODEL_API_URL")
-        self.key = os.environ.get("META_MODEL_API_KEY")
+    def __init__(self, backend: str | None = None):
+        from llm_backend import HTTPBackend, ScriptedBackend
+        be = backend or os.environ.get("FS_LLM_BACKEND", "http")
+        if be == "scripted":
+            self.backend = ScriptedBackend()
+        elif be == "http":
+            self.backend = HTTPBackend()
+        else:
+            raise ValueError(f"unknown LLM backend: {be!r}")
+
+    def is_live(self) -> bool:
+        return self.backend.configured
 
     def _build_prompt(self, error_slices: dict, catalog: dict,
                       round_no: int) -> str:
         import json as _json
         worst = error_slices.get("worst", [])[:5]
         return (
-            "You are a feature-discovery scientist for a movie recommender. "
-            "Baseline AUC 0.7439. Propose 2 falsifiable hypotheses about what "
-            "information the model is missing.\n\n"
-            f"Worst error slices: {_json.dumps(worst)}\n\n"
-            f"Data catalog: {_json.dumps(catalog, default=str)[:3000]}\n\n"
-            "For each hypothesis return: name, plain-English text, which "
-            "catalog sources it uses, and a point-in-time-correct computation "
-            "plan. WARNING: imdb_averageRating is an all-time aggregate -- "
-            "using it raw is temporal leakage and will be rejected."
+            "You are a feature-discovery scientist for a movie recommender "
+            "(MovieLens-1M: 1M ratings, 6k users, 3.9k movies). "
+            "Two-tower baseline AUC 0.7410. Propose exactly 2 falsifiable "
+            "hypotheses about what INFORMATION the model is missing -- not "
+            "hyperparameters, not model changes.\n\n"
+            f"Worst error slices (validation AUC by slice -- propose for "
+            f"these):\n{_json.dumps(worst)}\n\n"
+            f"Data catalog:\n{_json.dumps(catalog, default=str)[:3000]}\n\n"
+            + _CTX_API_REFERENCE + "\n\n"
+            "Respond ONLY with JSON:\n"
+            "{\n"
+            '  "reasoning": "<free-form: which slices, what information is '
+            'missing, why>",\n'
+            '  "hypotheses": [\n'
+            '    {"name": "<snake_case>", "text": "<plain-English hypothesis>",\n'
+            '     "sources": ["<catalog keys>"], "point_in_time": "timestamp",\n'
+            '     "temporal_scope": "train_only|pit_correct|static",\n'
+            '     "tower": "user|movie|wide", "serving": "<pattern>",\n'
+            '     "serving_notes": "<why this pattern>",\n'
+            '     "code": "def compute(df, ctx):\\n    ..."}\n'
+            "  ]\n"
+            "}\n"
+            "WARNING: imdb_averageRating / imdb_numVotes / ctx['imdb_map_avg'] "
+            "are ALL-TIME aggregates (votes through Oct 2026). Using them raw "
+            "to score a 2001 rating is TEMPORAL LEAKAGE and the deterministic "
+            "audit WILL reject it. Either build a point-in-time-correct "
+            "version or don't use them."
         )
 
     def propose(self, error_slices: dict, catalog: dict,
                 round_no: int) -> list[Hypothesis]:
-        raise NotImplementedError(
-            "LLMEngine is a stub. Set META_MODEL_API_URL and META_MODEL_API_KEY "
-            "and implement the API call in LLMEngine.propose() (see "
-            "_build_prompt for the prompt). Falling back to RuleBasedEngine."
-        )
+        from codegen import parse_llm_response, validate_spec, materialize_feature
+        from llm_backend import LLMNotConfiguredError
+        if not self.backend.configured:
+            raise LLMNotConfiguredError(
+                "LLM backend not configured. Set FS_LLM_BASE_URL / "
+                "FS_LLM_API_KEY / FS_LLM_MODEL, or use --backend scripted.")
+        raw = self.backend.propose(
+            self._build_prompt(error_slices, catalog, round_no))
+        payload = parse_llm_response(raw)
+        hyps_payload = payload.get("hypotheses", [])
+        if not hyps_payload:
+            from llm_backend import LLMError
+            raise LLMError("LLM returned no hypotheses")
+        reasoning = payload.get("reasoning", "")
+        hyps = []
+        for spec in hyps_payload:
+            spec = validate_spec(spec)
+            h = Hypothesis(
+                text=spec["text"],
+                feature_name=spec["name"],
+                sources=list(spec["sources"]),
+                rationale=(reasoning[:400] or
+                           f"LLM round {round_no} hypothesis"),
+                trap=False,
+            )
+            h.llm_spec = spec
+            h.reasoning = reasoning
+            # Non-agentic path compatibility: build materializes directly.
+            h.build = (lambda ctx, s=spec: materialize_feature(s))
+            hyps.append(h)
+        return hyps
 
 
-def get_engine(name: str) -> HypothesisEngine:
+# API reference shipped inside the LLM prompt: what generated code may touch.
+_CTX_API_REFERENCE = """\
+API reference — your feature code runs as `def compute(df, ctx):` and must
+return a pd.Series aligned to df.index. The restricted namespace provides
+only pd (pandas), np (numpy) and safe builtins. NO imports, NO I/O,
+NO eval/exec/open. df has columns: user_id, movie_id, rating, timestamp
+(prediction time T, seconds since epoch), liked.
+
+ctx tables you may read:
+- movie_events / user_events: {id: (sorted timestamps, ratings)}, built from
+  TRAIN rows only. Filter by row time: ev[1][ev[0] <= T]  (safe, as-of)
+- user_genre_rate: train-only user×genre like-rates (safe)
+- movie_to_director: static IMDb credits (safe)
+- movie_release_ts: {movie_id: release timestamp}, time-invariant (safe)
+- median_movie_age_days: train scalar (safe)
+- director_prefix: per-director release-sorted prefix sums, train stats (safe)
+- global_mean / global_like: train scalars (safe)
+- imdb (DataFrame), imdb_map_avg: ALL-TIME IMDb aggregates — DANGEROUS
+- movie_mean_all: means over train+validation — DANGEROUS (future data)
+
+Point-in-time rules: for each scored row with prediction time T you may only
+use source data with time <= T, time-invariant metadata, or train-period
+aggregates. Anything else is temporal leakage.
+
+Serving patterns (declare one, honestly): row_local (0.5u, pure row function),
+lookup (1.0u, O(1) precomputed table), history_scan (25u, full history scan per
+request), external (60u, network call). Per-feature budget: 8.0u — a
+history_scan feature will be rejected for cost.
+
+Tower routing (declare one): "user" (user-side signal), "movie" (movie-side
+signal), "wide" (user×movie interaction)."""
+
+
+def get_engine(name: str, backend: str = "http") -> HypothesisEngine:
     if name == "rule":
         return RuleBasedEngine()
     if name == "llm":
-        return LLMEngine()
+        return LLMEngine(backend=backend)
     raise ValueError(f"unknown engine: {name}")

@@ -197,3 +197,129 @@ python3 src/arena.py            # open http://localhost:8765
 
 Watch hypotheses appear live: acceptances climb the leaderboard while the
 leakage liar and the budget-buster get caught on camera.
+
+## Agentic loop (LLM proposer + critic + retry-on-rejection)
+
+The rule engine is scripted; the **agentic** engine puts a real LLM in the
+`propose` seat (`--engine llm`). The LLM's output is free-form reasoning
+plus a structured spec (name, text, sources, PIT declaration, tower,
+serving pattern, and `code` = a `compute(df, ctx)` body). The reasoning is
+recorded verbatim in the ledger; the machinery judges the code.
+
+**Two roles, one loop** (`src/llm_backend.py`, `src/critic.py`,
+`src/codegen.py`, `src/agentic.py`):
+
+1. **Proposer** — reads the worst error slices + data catalog (+ API
+   reference: ctx tables, PIT rules, serving budgets, tower routing) and
+   returns reasoning + hypotheses.
+2. **Critic** (skeptic) — tries to kill each hypothesis *before* it costs
+   anything: PIT violations, serving-cost overruns, circular signals. On
+   reject → **one revision round**, then re-critic once.
+3. **Materialize** — the code is AST safety-checked (no imports, no I/O, no
+   `eval`/`exec`/`open`), written to a real file under
+   `results/gen_features/` so the hardened leakage audit can
+   `inspect.getsource()` it, then `exec`'d in a restricted namespace
+   (pd, np, safe builtins only). Fail-closed at every step.
+4. **Deterministic gates** — leakage audit → serving-cost check → ablation,
+   in that order. A rejection at the audit *or* cost gate feeds the exact
+   rejection reason back to the LLM for **one revision attempt**
+   (retry-on-rejection); the revision is re-audited before proceeding.
+5. **Ledger** — every entry carries an `agentic` block: free-form reasoning,
+   each critique, each revision (stage, feedback, from→to, code), and every
+   attempt's verdict. That's the reasoning trail.
+
+**Backends** (`--backend`, default `http`):
+
+```bash
+# Offline test double: deterministic canned arcs, no network, no keys.
+.venv/bin/python src/run_scientist.py --rounds 1 --engine llm --backend scripted
+
+# Real model: OpenAI-compatible chat completions (stdlib urllib, no new deps).
+export FS_LLM_BASE_URL="https://api.openai.com/v1"   # or the Meta Model API endpoint
+export FS_LLM_API_KEY="..."
+export FS_LLM_MODEL="gpt-4o"                         # or llama-3.3-70b, ...
+.venv/bin/python src/run_scientist.py --rounds 2 --engine llm --backend http
+```
+
+No key → clear error + automatic fallback to the rule engine for that
+round. The scripted backend stages two arcs end-to-end: (a) propose →
+critic-reject (serving cost) → revise → accept; (b) critic-pass →
+audit-reject (all-time IMDb aggregate = temporal leakage) → revise with a
+PIT-clean feature → accept. Both land in the ledger with the full trail.
+
+Design note: the critic is *advisory* — the deterministic audit is the hard
+gate. A good critic catch saves an audit cycle; a missed catch is still
+caught downstream. Defense in depth, and the ledger shows which layer
+caught what.
+
+## Data catalog: offline crawl + searchable registry
+
+The agent reasons over a **big array of candidate features**, not a hand-coded
+handful. Discovery works in two layers:
+
+**1. Offline crawl (outside the agent).** `src/crawl_wikidata.py` queries the
+Wikidata Query Service (IMDb id = P345) in polite batches for directors,
+cast, awards (P166), box office (P2142), budget (P2130), release date and
+original language — entity refs kept as QIDs, labels resolved for
+directors/awards/languages. Raw responses are cached per chunk
+(`data/wikidata/raw/`), the script is resume-friendly, and coverage is
+reported honestly per field.
+
+```bash
+python3 src/crawl_wikidata.py --chunk 100 --delay 65   # ~40 min for 3.9k movies
+```
+
+**2. Searchable registry.** `src/catalog/` holds `registry.json` — every table
+(ml1m_ratings, ml1m_users, ml1m_movies, imdb_enrichment, wikidata_movies) with
+*per-column* metadata: plain-English description, dtype, join key,
+`temporal_scope` (`time_invariant` | `point_in_time_safe` | `all_time`),
+serving class, and honestly-computed coverage %. A SQLite FTS5 index
+(`catalog.db`) powers the discovery API:
+
+```python
+from catalog import search_datasets
+search_datasets("director awards")
+# -> wikidata_movies.awards  scope=all_time (fail-closed: wins may postdate
+#    prediction time) ...
+```
+
+`DATA_CATALOG` in `src/scientist.py` now loads from the registry (same dict
+shape as before, plus `column_meta`), and engines can call `search_datasets`
+to discover data instead of reading a hardcoded list. Rebuild anytime with:
+
+```bash
+cd src && ../.venv/bin/python -m catalog.build_catalog
+```
+
+**Temporal honesty is load-bearing metadata.** Columns like
+`imdb_averageRating` and `wikidata_movies.awards` are marked `all_time`:
+fail-closed, raw use is temporal leakage. The LLM reasons over these
+annotations when it proposes features — the same annotations the leakage
+audit enforces.
+
+## Calibration screening (screen 50, ablate 5)
+
+`src/calibration.py` adds a screening stage between error analysis and
+ablation: bucket validation rows by a *candidate* feature (not in the
+model), compare the baseline's mean predicted P(liked) against the actual
+like rate per bucket, and flag significant gaps. Deterministic and
+inference-only — no retraining, so no seed noise, which is what makes it
+trustworthy at 0.1%-gain scale. Each feature gets a one-line plain-English
+summary for the LLM prompt, e.g. "newest decile under-predicted by 2.1pp".
+
+Sparse features are handled explicitly (`screen_sparse_id`): high-cardinality
+IDs are never bucketed raw — the screen derives popularity (train-period
+frequency, the cold-start diagnostic) and recency proxies instead. Rare
+binary flags with underpowered positive buckets report
+`insufficient_evidence`, never "no signal".
+
+```bash
+cd src && ../.venv/bin/python demo_calibration.py
+# movie_age_days -> signal (same finding as its +0.0005 AUC ablation, zero retraining)
+# random_noise   -> no_signal
+# rare_flag      -> insufficient_evidence (positive bucket n=21)
+```
+
+Integration point (new stage: error analysis → calibration screen →
+ablation): `screen_candidates(y_valid, proba, {name: series})`,
+`format_table(results)`; details in `docs/calibration_integration.md`.

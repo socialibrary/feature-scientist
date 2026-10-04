@@ -35,7 +35,7 @@ def load_entries(path: str = LEDGER_PATH) -> list[dict]:
 
 def build_entry(round_no: int, hypothesis, feature, audit_result,
                 cost_verdict, metrics: dict | None, verdict: str,
-                reason: str) -> dict:
+                reason: str, agentic: dict | None = None) -> dict:
     try:
         code = inspect.getsource(feature.compute)
     except (OSError, TypeError):
@@ -61,4 +61,7 @@ def build_entry(round_no: int, hypothesis, feature, audit_result,
         "metrics": metrics,
         "verdict": verdict,   # accepted | rejected
         "reason": reason,
+        # Agentic trail (LLM engine only): free-form reasoning, critiques,
+        # revisions with the feedback that caused them, per-attempt verdicts.
+        "agentic": agentic,
     }

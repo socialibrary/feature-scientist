@@ -22,19 +22,22 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from ablation import ablate
+from agentic import process_agentic
 from baseline import TARGET, RESULTS_PATH as LGBM_RESULTS_PATH, featurize
 from error_analysis import analyze, train_baseline_predict
 from features import FeatureRegistry
 from leakage import audit_feature
 from ledger import append_entry, build_entry, load_entries
-from scientist import DATA_CATALOG, build_ctx, get_engine
+from llm_backend import LLMNotConfiguredError
+from scientist import DATA_CATALOG, LLMEngine, build_ctx, get_engine
 from serving_cost import MAX_TOTAL_UNITS, check_budget
 from two_tower import RESULTS_PATH as TORCH_RESULTS_PATH
 
 ACCEPT_DELTA_AUC = 0.0005
 
 
-def run(rounds: int, engine_name: str, model_backend: str = "torch") -> list[dict]:
+def run(rounds: int, engine_name: str, model_backend: str = "torch",
+        llm_backend: str = "http") -> list[dict]:
     # --- one-time setup: data, baseline model, error slices, ctx -----------
     train, valid, stats, model_info, proba, cutoff_ts = \
         train_baseline_predict(model_backend)
@@ -64,10 +67,19 @@ def run(rounds: int, engine_name: str, model_backend: str = "torch") -> list[dic
         X_valid_base = featurize(valid, stats)
 
     try:
-        engine = get_engine(engine_name)
+        engine = get_engine(engine_name, backend=llm_backend)
     except ValueError as e:
         print(e)
         sys.exit(2)
+
+    agentic = isinstance(engine, LLMEngine) and engine.is_live()
+    if engine_name == "llm":
+        if agentic:
+            print(f"agentic loop live via '{engine.backend.name}' backend: "
+                  "propose -> critic -> revise -> audit -> cost -> ablate, "
+                  "with one revision round after each rejection.")
+        else:
+            print("LLM backend not configured; will fall back per round.")
 
     registry = FeatureRegistry()
     ledger_entries: list[dict] = []
@@ -78,15 +90,31 @@ def run(rounds: int, engine_name: str, model_backend: str = "torch") -> list[dic
         print(f"\n{'=' * 60}\nROUND {r}\n{'=' * 60}")
         try:
             hypotheses = engine.propose(slices, DATA_CATALOG, r)
-        except NotImplementedError as e:
+        except (NotImplementedError, LLMNotConfiguredError) as e:
             print(f"engine unavailable: {e}\nfalling back to RuleBasedEngine")
             hypotheses = get_engine("rule").propose(slices, DATA_CATALOG, r)
+            agentic = False
 
         if not hypotheses:
             print("no hypotheses proposed this round.")
             continue
 
+        run_ctx = {
+            "ctx": ctx, "train": train, "valid": valid, "stats": stats,
+            "base_auc": base_auc, "base_ll": base_ll,
+            "prep": prep, "X_train_base": X_train_base,
+            "X_valid_base": X_valid_base, "model_backend": model_backend,
+            "engine": engine, "accepted_cost_units": accepted_cost_units,
+            "accept_delta": ACCEPT_DELTA_AUC,
+        }
         for h in hypotheses:
+            if agentic and getattr(h, "llm_spec", None):
+                print(f"\n-- agentic hypothesis: {h.text}")
+                print(f"   sources: {', '.join(h.sources)}")
+                entry, accepted_cost_units = process_agentic(r, h, run_ctx)
+                run_ctx["accepted_cost_units"] = accepted_cost_units
+                ledger_entries.append(entry)
+                continue
             print(f"\n-- hypothesis: {h.text}")
             print(f"   sources: {', '.join(h.sources)}")
             feature = h.build(ctx)
@@ -154,11 +182,17 @@ def main() -> None:
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--engine", type=str, default="rule",
                     choices=["rule", "llm"])
+    ap.add_argument("--backend", type=str, default="http",
+                    choices=["http", "scripted"],
+                    help="LLM backend for --engine llm: OpenAI-compatible "
+                         "HTTP (needs FS_LLM_* env) or the offline scripted "
+                         "test double")
     ap.add_argument("--model", type=str, default="torch",
                     choices=["torch", "lgbm"],
                     help="two-tower (default) or LightGBM baseline+ablations")
     args = ap.parse_args()
-    entries = run(args.rounds, args.engine, args.model)
+    entries = run(args.rounds, args.engine, args.model,
+                  llm_backend=args.backend)
     print_summary(entries)
     print(f"\nledger: results/experiments.jsonl ({len(load_entries())} entries total)")
 
