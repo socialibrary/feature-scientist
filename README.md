@@ -1,17 +1,22 @@
-# Feature Scientist — ML Harness (Days 1–2)
+# Feature Scientist — ML Harness + Science Loop (Days 1–4)
 
 An autonomous "AI Feature Scientist" agent for the Meta global AI hackathon:
 given a model and an objective, it figures out **what information the model is
 missing**, invents new features, proves they help, and rejects the ones that
 leak or cost too much to serve.
 
-This repo currently holds the **Days 1–2 harness**: data loading, a strict
-temporal split, a baseline model, and a feature-registry stub. The agent loop
-(Days 3–4), the judgment layer / leakage detector (Days 5–6), the arena UI
-(Days 7–8), and demo rehearsal (Days 9–10) build on top of it.
+This repo holds the **Days 1–2 harness** (data, temporal split, baseline) plus
+the **Days 3–4 science loop**: error-slice analysis, hypothesis engines, the
+leakage audit, ablations, and an append-only experiment ledger. The judgment
+layer hardening (Days 5–6), arena UI (Days 7–8), and demo rehearsal (Days 9–10)
+build on top.
 
 Dataset: **MovieLens-1M** (public, https://grouplens.org/datasets/movielens/1m/)
-— 1,000,209 ratings, 6,040 users, 3,706 movies. No Meta-internal anything.
+— 1,000,209 ratings, 6,040 users, 3,706 movies — **plus IMDb enrichment**
+(`data/imdb/movie_enrichment.csv`): 86% title join, directors, runtime, and
+IMDb ratings/votes. Note: `imdb_averageRating`/`numVotes` are **all-time**
+aggregates — raw use is temporal leakage, and the audit catches it. No
+Meta-internal anything.
 
 ## Setup
 
@@ -28,17 +33,34 @@ python3 -m venv .venv
 ```bash
 .venv/bin/python src/data.py      # load + join the three .dat files
 .venv/bin/python src/split.py     # strict temporal train/valid split
-.venv/bin/python src/baseline.py  # train baseline, report metrics
+.venv/bin/python src/baseline.py  # LightGBM baseline (fallback path)
+.venv/bin/python src/two_tower.py # PyTorch two-tower baseline (primary)
+.venv/bin/python src/error_analysis.py            # error slices (two-tower)
+.venv/bin/python src/error_analysis.py --model lgbm  # error slices (LightGBM)
+.venv/bin/python src/run_scientist.py --rounds 3               # science loop (two-tower)
+.venv/bin/python src/run_scientist.py --rounds 3 --model lgbm  # science loop (LightGBM)
 ```
 
-End-to-end runtime: **under 1 minute** on CPU.
+End-to-end harness runtime: **under 1 minute** on CPU. A full 3-round science
+loop takes ~6 minutes (one ~40s ablation per surviving hypothesis).
 
 ## Baseline results
 
+Primary model: **PyTorch two-tower** (`src/two_tower.py`) — user tower
+(5 user-side features → MLP → 48-dim embedding), movie tower (20 movie-side
+features → MLP → 48-dim embedding), dot product + bias, `BCEWithLogitsLoss`.
+Trains on 800k rows in ~80s on CPU (4 epochs, batch 65536).
+
 | metric | validation |
 |---|---|
-| AUC | **0.7439** |
-| log-loss | **0.5882** |
+| AUC | **0.7410** |
+| log-loss | **0.5919** |
+
+LightGBM (`src/baseline.py`) remains as a `--model lgbm` fallback
+(AUC 0.7439). The science loop defaults to the two-tower; candidate
+features are routed to the appropriate tower's input
+(`provenance["tower"]`: `user` | `movie` | `wide`) and ablated against
+the two-tower baseline.
 
 Train: 800,168 rows (2000-04-25 → 2000-12-02) · Valid: 200,041 rows
 (2000-12-02 → 2003-02-28). Label: `liked = (rating >= 4)`, positive rate ≈ 0.57.
@@ -51,12 +73,49 @@ This is the number the agent has to beat.
 
 ```
 data/ml-1m/        # MovieLens-1M .dat files (ratings/users/movies)
+data/imdb/         # movie_enrichment.csv (86% IMDb title join; raw dumps git-ignored)
 src/data.py        # loader: parses '::'-separated latin-1 files, joins, labels
 src/split.py       # STRICT temporal split (guarantee: max(train.ts) < min(valid.ts))
 src/baseline.py    # baseline model; aggregates computed on train period ONLY
-src/features.py    # FeatureRegistry stub: name + compute() + point_in_time declaration
-results/           # baseline_metrics.json
+src/features.py    # FeatureRegistry: name + compute() + point_in_time + provenance
+src/error_analysis.py  # validation error slices (activity/popularity/genre/time)
+src/scientist.py   # DATA_CATALOG, Hypothesis, RuleBasedEngine, LLMEngine stub,
+                   #   executable feature builders, build_ctx()
+src/ablation.py    # baseline+feature training, AUC/log-loss deltas
+src/leakage.py     # first-pass audit: provenance vs temporal discipline
+src/ledger.py      # append-only experiment ledger (results/experiments.jsonl)
+src/run_scientist.py  # CLI orchestrator: --rounds N [--engine rule|llm]
+src/imdb_join.py   # IMDb bulk-download + title/year join (one-off scaffold)
+results/           # baseline_metrics.json, error_slices.json, experiments.jsonl
+docs/imdb_join.md  # IMDb join method, hit rate, temporal caveat
 ```
+
+## The science loop (Days 3–4)
+
+```
+error slices -> propose -> build -> leakage audit -> ablate -> ledger
+```
+
+1. **Error slices** (`error_analysis.py`): where does the baseline fail?
+   Cold movies, light users, specific genres/months — written to
+   `results/error_slices.json`.
+2. **Propose** (`scientist.py`): `RuleBasedEngine` (default, no API keys)
+   turns the worst slices into falsifiable hypotheses, reasoning over the
+   v1 **data catalog** (ml-1m + IMDb). `LLMEngine` is a stub marking the
+   Meta Model API seam (`META_MODEL_API_URL` / `META_MODEL_API_KEY`).
+3. **Build**: each hypothesis becomes an executable `Feature`,
+   auto-registered with a `point_in_time` declaration and a `provenance`
+   record (`temporal_scope`: `train_only` | `pit_correct` | `static` |
+   `all_time`). Two deliberate leakage traps are planted so the demo can
+   show the audit catching them.
+4. **Leakage audit** (`leakage.py`): rejects anything with `all_time`
+   scope or future-built ctx tables — before any training time is spent.
+5. **Ablate** (`ablation.py`): survivors are routed to the right tower
+   (`user`/`movie`/`wide`) and the two-tower retrains on the temporal split
+   (`--model lgbm` keeps the original flat-matrix path); accept iff AUC
+   lift >= 0.0005.
+6. **Ledger** (`ledger.py`): every hypothesis lands in
+   `results/experiments.jsonl` with its code, audit, metrics, and verdict.
 
 ## Key design decisions (for the demo)
 

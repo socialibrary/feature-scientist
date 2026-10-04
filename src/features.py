@@ -35,6 +35,14 @@ class Feature:
     compute: FeatureFn
     point_in_time: str = "timestamp"
     description: str = ""
+    # Provenance powers the Day 5-6 leakage audit. temporal_scope is one of:
+    #   "train_only"  - reads only aggregates/tables built from train rows
+    #   "pit_correct" - reads timestamped data but only at/before each row's
+    #                   prediction time (as-of / point-in-time logic)
+    #   "static"      - reads time-invariant metadata (no leakage possible)
+    #   "all_time"    - reads aggregates that include data NEWER than the
+    #                   prediction time  -> TEMPORAL LEAKAGE, must be rejected
+    provenance: dict = field(default_factory=dict)
 
 
 @dataclass
