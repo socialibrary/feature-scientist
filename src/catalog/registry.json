@@ -1,0 +1,289 @@
+{
+ "ml1m_ratings": {
+  "description": "1,000,209 user-movie ratings with timestamps (MovieLens-1M). The event stream every behavioral feature is built from.",
+  "join_keys": [
+   "user_id",
+   "movie_id"
+  ],
+  "n_columns": 5,
+  "columns": {
+   "user_id": {
+    "description": "MovieLens user id (1-6040). Join key to ml1m_users.",
+    "dtype": "int",
+    "temporal_scope": "time_invariant",
+    "serving": "row_local",
+    "join_key": true,
+    "coverage": 1.0
+   },
+   "movie_id": {
+    "description": "MovieLens movie id (1-3952). Join key to ml1m_movies.",
+    "dtype": "int",
+    "temporal_scope": "time_invariant",
+    "serving": "row_local",
+    "join_key": true,
+    "coverage": 1.0
+   },
+   "rating": {
+    "description": "Whole-star rating 1-5. The observed event itself; aggregates over ratings must be as-of prediction time.",
+    "dtype": "int",
+    "temporal_scope": "point_in_time_safe",
+    "serving": "history_scan",
+    "join_key": false,
+    "coverage": 1.0
+   },
+   "timestamp": {
+    "description": "Seconds since epoch. THE prediction-time anchor: a feature is PIT-correct only if it reads rows with timestamp <= the scored row's timestamp.",
+    "dtype": "int",
+    "temporal_scope": "point_in_time_safe",
+    "serving": "row_local",
+    "join_key": false,
+    "coverage": 1.0
+   },
+   "liked": {
+    "description": "Derived label: rating >= 4. The prediction target.",
+    "dtype": "int",
+    "temporal_scope": "point_in_time_safe",
+    "serving": "row_local",
+    "join_key": false,
+    "coverage": 1.0
+   }
+  }
+ },
+ "ml1m_users": {
+  "description": "6,040 users: volunteered demographics (gender, age bucket, occupation code, zip). Static per user.",
+  "join_keys": [
+   "user_id"
+  ],
+  "n_columns": 5,
+  "columns": {
+   "user_id": {
+    "description": "Join key to ml1m_ratings.",
+    "dtype": "int",
+    "temporal_scope": "time_invariant",
+    "serving": "row_local",
+    "join_key": true,
+    "coverage": 1.0
+   },
+   "gender": {
+    "description": "M/F, volunteered.",
+    "dtype": "str",
+    "temporal_scope": "time_invariant",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 1.0
+   },
+   "age": {
+    "description": "Bucket code: 1=Under 18, 18=18-24, 25=25-34, 35=35-44, 45=45-49, 50=50-55, 56=56+.",
+    "dtype": "int",
+    "temporal_scope": "time_invariant",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 1.0
+   },
+   "occupation": {
+    "description": "Coded 0-20 (student, engineer, educator, ...).",
+    "dtype": "int",
+    "temporal_scope": "time_invariant",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 1.0
+   },
+   "zip": {
+    "description": "Zip code, volunteered, noisy.",
+    "dtype": "str",
+    "temporal_scope": "time_invariant",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 1.0
+   }
+  }
+ },
+ "ml1m_movies": {
+  "description": "~3,900 movies: title (with release year), pipe-separated genres.",
+  "join_keys": [
+   "movie_id"
+  ],
+  "n_columns": 3,
+  "columns": {
+   "movie_id": {
+    "description": "Join key to ml1m_ratings and imdb_enrichment.movieId.",
+    "dtype": "int",
+    "temporal_scope": "time_invariant",
+    "serving": "row_local",
+    "join_key": true,
+    "coverage": 1.0
+   },
+   "title": {
+    "description": "IMDb title including release year, e.g. 'Toy Story (1995)'.",
+    "dtype": "str",
+    "temporal_scope": "time_invariant",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 1.0
+   },
+   "genres": {
+    "description": "Pipe-separated genres (Action|Comedy|...). 18 possible values.",
+    "dtype": "str",
+    "temporal_scope": "time_invariant",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 1.0
+   }
+  }
+ },
+ "imdb_enrichment": {
+  "description": "IMDb bulk-data join: 86% of movies, 94% of ratings. Downloaded offline from datasets.imdbws.com; refresh = re-download.",
+  "join_keys": [
+   "movieId",
+   "tconst"
+  ],
+  "n_columns": 8,
+  "columns": {
+   "movieId": {
+    "description": "Join key = ml1m_movies.movie_id.",
+    "dtype": "int",
+    "temporal_scope": "time_invariant",
+    "serving": "row_local",
+    "join_key": true,
+    "coverage": 1.0
+   },
+   "tconst": {
+    "description": "IMDb title id (tt0114709). Join key to wikidata_movies.",
+    "dtype": "str",
+    "temporal_scope": "time_invariant",
+    "serving": "row_local",
+    "join_key": true,
+    "coverage": 0.8627
+   },
+   "primaryTitle": {
+    "description": "Canonical IMDb title.",
+    "dtype": "str",
+    "temporal_scope": "time_invariant",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 0.8627
+   },
+   "startYear": {
+    "description": "Release year. Time-invariant, safe raw.",
+    "dtype": "float",
+    "temporal_scope": "time_invariant",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 0.8627
+   },
+   "runtimeMinutes": {
+    "description": "Runtime in minutes. Time-invariant, safe raw. Sparse for obscure titles.",
+    "dtype": "float",
+    "temporal_scope": "time_invariant",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 0.8625
+   },
+   "directors": {
+    "description": "IMDb name ids (nm...) pipe-separated, from title.crew. Time-invariant. Overlaps wikidata_movies.directors.",
+    "dtype": "str",
+    "temporal_scope": "time_invariant",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 0.8625
+   },
+   "imdb_averageRating": {
+    "description": "ALL-TIME aggregate (votes through crawl date). LEAKAGE if used raw to score a 2001 rating.",
+    "dtype": "float",
+    "temporal_scope": "all_time",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 0.862
+   },
+   "imdb_numVotes": {
+    "description": "ALL-TIME vote count. Same leakage warning as averageRating.",
+    "dtype": "float",
+    "temporal_scope": "all_time",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 0.862
+   }
+  }
+ },
+ "wikidata_movies": {
+  "description": "Wikidata crawl keyed by IMDb tconst (P345): directors, cast, awards, box office, budget, release date, language. Crawled offline by src/crawl_wikidata.py; entity refs are QIDs (labels resolved for directors/awards/languages).",
+  "join_keys": [
+   "tconst"
+  ],
+  "n_columns": 9,
+  "columns": {
+   "tconst": {
+    "description": "Join key = imdb_enrichment.tconst.",
+    "dtype": "str",
+    "temporal_scope": "time_invariant",
+    "serving": "row_local",
+    "join_key": true,
+    "coverage": 1.0
+   },
+   "wikidata_qid": {
+    "description": "Wikidata entity id (Q...).",
+    "dtype": "str",
+    "temporal_scope": "time_invariant",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 0.9931
+   },
+   "directors": {
+    "description": "Director QIDs, |-separated. Time-invariant. Overlaps imdb_enrichment.directors (different id space).",
+    "dtype": "str",
+    "temporal_scope": "time_invariant",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 0.9899
+   },
+   "cast": {
+    "description": "Cast-member QIDs, |-separated (can be dozens per film). Time-invariant. Useful for cast-track-record features.",
+    "dtype": "str",
+    "temporal_scope": "time_invariant",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 0.9478
+   },
+   "awards": {
+    "description": "Award QIDs (P166), |-separated, CURRENT as of crawl date. FAIL-CLOSED all_time: a film may have won awards AFTER prediction time, so raw use leaks the future. Needs award-date filtering for PIT-correct use.",
+    "dtype": "str",
+    "temporal_scope": "all_time",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 0.2419
+   },
+   "box_office_amount": {
+    "description": "Box-office gross (P2142), raw amount. ALL-TIME final gross; MIXED CURRENCIES across films. Leakage if raw; needs normalization + PIT care.",
+    "dtype": "float",
+    "temporal_scope": "all_time",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 0.2724
+   },
+   "budget_amount": {
+    "description": "Production budget (P2130), raw amount. Set pre-release so time-invariant in principle, but VERY sparse on Wikidata. Mixed currencies.",
+    "dtype": "float",
+    "temporal_scope": "time_invariant",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 0.3225
+   },
+   "release_date": {
+    "description": "Publication/release date (P577), YYYY-MM-DD.",
+    "dtype": "str",
+    "temporal_scope": "time_invariant",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 0.9911
+   },
+   "original_language": {
+    "description": "Original-language QID (P364). Time-invariant.",
+    "dtype": "str",
+    "temporal_scope": "time_invariant",
+    "serving": "lookup",
+    "join_key": false,
+    "coverage": 0.9836
+   }
+  }
+ }
+}

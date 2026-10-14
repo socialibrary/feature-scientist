@@ -41,12 +41,108 @@ GENRES = [
 ]
 
 
-def train_baseline_predict(model_backend: str = "torch"):
+def train_baseline_predict(model_backend: str = "torch", brief: dict | None = None):
     """Train baseline on the temporal split; return everything downstream needs.
 
     model_backend: "torch" (two-tower, default) or "lgbm" (LightGBM).
     Returns (train, valid, stats, model_info, valid_proba, cutoff_ts).
+
+    If brief is provided with non-MovieLens tables, uses generic loading.
     """
+    # Generic path: load from brief tables (for non-MovieLens tasks).
+    if brief is not None:
+        from brief_data import load_brief_data
+        try:
+            train, valid, target = load_brief_data(brief)
+            print(f"loaded generic data: {len(train)} train, {len(valid)} valid, "
+                  f"target={target}")
+            # For generic tasks, use a simple baseline (no MovieLens stats).
+            # Return with minimal stats; the LGBM path featurizes directly.
+            import baseline as _bl
+            orig_target = _bl.TARGET
+            _bl.TARGET = target
+            try:
+                stats = {}
+                cutoff_ts = None
+                if model_backend == "lgbm":
+                    from baseline import (encode_labels, featurize_tabular,
+                                          fit_tabular_schema, make_model,
+                                          make_regressor, transform_target)
+                    # Train-fit schema so baseline and ablation matrices
+                    # always share columns (train-only discipline).
+                    # text_columns: None = auto-detect free-text columns for
+                    # the TF-IDF path. exclude_columns: sibling targets in
+                    # multi-target competitions (never a feature).
+                    _text_cols = brief.get("text_columns")
+                    _exclude = brief.get("exclude_columns") or []
+                    _schema = fit_tabular_schema(train, target,
+                                                 text_columns=_text_cols,
+                                                 exclude=_exclude)
+                    X_train = featurize_tabular(train, target, _schema,
+                                                exclude=_exclude)
+                    y_train_raw = train[target].to_numpy()
+                    X_valid = featurize_tabular(valid, target, _schema,
+                                                exclude=_exclude)
+                    print("training baseline...")
+                    import numpy as np
+                    # Task type: explicit brief override wins; otherwise
+                    # auto-detect (float target or many distinct values).
+                    _tt = (brief or {}).get("task_type")
+                    if _tt is None:
+                        is_regression = y_train_raw.dtype.kind == 'f' \
+                            or len(np.unique(y_train_raw)) > 10
+                    else:
+                        is_regression = str(_tt).lower() == "regression"
+                    _tform = (brief or {}).get("target_transform")
+                    _metric = (brief or {}).get("metric") \
+                        or ("rmse" if is_regression else "auc")
+                    _n_classes = _label_classes = None
+                    if is_regression:
+                        y_train = transform_target(y_train_raw, _tform)
+                        model = make_regressor()
+                        model.fit(X_train, y_train)
+                        # Predictions live in the transformed space; the
+                        # metric is computed there too (e.g. rmse on
+                        # log1p(SalePrice) == the Kaggle metric).
+                        proba = model.predict(X_valid)
+                    elif _metric == "logloss":
+                        # Multiclass (or binary) classification gated on
+                        # log-loss delta -- the text competitions' metric.
+                        y_tr, _, _label_classes = encode_labels(y_train_raw)
+                        _n_classes = len(_label_classes)
+                        model = make_model(
+                            _n_classes if _n_classes > 2 else None)
+                        model.fit(X_train, y_tr)
+                        proba = model.predict_proba(X_valid)
+                    else:
+                        y_tr, _, _label_classes = encode_labels(y_train_raw)
+                        if len(_label_classes) > 2:
+                            raise ValueError(
+                                f"target has {len(_label_classes)} classes "
+                                "but metric is 'auc' (binary); use "
+                                "metric: logloss for multiclass briefs")
+                        model = make_model()
+                        model.fit(X_train, y_tr)
+                        proba = model.predict_proba(X_valid)[:, 1]
+                    return train, valid, stats, {
+                        "backend": "lgbm", "model": model,
+                        "is_regression": is_regression,
+                        "metric": _metric,
+                        "target_transform": _tform,
+                        "tabular_schema": _schema,
+                        "n_classes": _n_classes,
+                        "label_classes": None if _label_classes is None
+                        else [str(c) for c in _label_classes],
+                        "exclude_columns": list(_exclude),
+                    }, proba, cutoff_ts
+            finally:
+                _bl.TARGET = orig_target
+        except Exception as e:
+            if brief is not None:
+                # An explicit brief must not silently run MovieLens data.
+                raise RuntimeError(
+                    f"generic brief loading failed: {e}") from e
+            print(f"generic loading failed ({e}), falling back to MovieLens")
     print("loading data + temporal split...")
     df = load_all()
     train, valid, cutoff_ts = temporal_split(df)
@@ -91,9 +187,13 @@ def _slice_stats(y: np.ndarray, p: np.ndarray) -> dict:
 
 
 def analyze(train: pd.DataFrame, valid: pd.DataFrame, proba: np.ndarray,
-            stats: dict) -> dict:
+            stats: dict, target: str | None = None) -> dict:
     """Compute per-slice metrics on the validation predictions."""
-    y = valid[TARGET].to_numpy()
+    _target = target or TARGET
+    y = valid[_target].to_numpy()
+    # Generic fallback: if not MovieLens columns, return minimal slices.
+    if "user_id" not in valid.columns:
+        return {"worst": [], "slices": {}}
     frame = pd.DataFrame({"y": y, "p": proba})
     slices: dict[str, list[dict]] = {}
 
@@ -131,7 +231,12 @@ def analyze(train: pd.DataFrame, valid: pd.DataFrame, proba: np.ndarray,
     slices["genre"] = rows
 
     # --- time (calendar month of the validation rating) ---
-    month = valid["datetime"].dt.to_period("M").astype(str).to_numpy()
+    # tz-aware datetimes warn on to_period (tz info is dropped); strip tz
+    # first -- month buckets don't need it.
+    _dt = valid["datetime"]
+    if _dt.dt.tz is not None:
+        _dt = _dt.dt.tz_localize(None)
+    month = _dt.dt.to_period("M").astype(str).to_numpy()
     rows = []
     for mo in sorted(np.unique(month)):
         m = month == mo

@@ -88,11 +88,23 @@ def validate_spec(spec: dict) -> dict:
         raise CodegenError(
             f"unknown serving pattern {spec['serving']!r}; "
             f"want {sorted(SERVING_PATTERNS)}")
+    # Normalize common LLM variants to the valid enums.
+    _scope_aliases = {
+        "as_of_point_in_time": "static",
+        "point_in_time": "pit_correct",
+        "static_snapshot": "static",
+    }
+    if spec["temporal_scope"] in _scope_aliases:
+        spec["temporal_scope"] = _scope_aliases[spec["temporal_scope"]]
     if spec["temporal_scope"] not in TEMPORAL_SCOPES:
         raise CodegenError(
             f"unknown temporal_scope {spec['temporal_scope']!r}; "
             f"want {TEMPORAL_SCOPES}")
-    if spec["point_in_time"] != "timestamp":
+    # For static scope (generic tabular tasks), point_in_time is irrelevant
+    # (row-local features); coerce to 'timestamp' to avoid LLM schema confusion.
+    if spec.get("temporal_scope") == "static":
+        spec["point_in_time"] = "timestamp"
+    elif spec["point_in_time"] != "timestamp":
         raise CodegenError(
             f"unsupported point_in_time {spec['point_in_time']!r}; "
             "only 'timestamp' is supported")

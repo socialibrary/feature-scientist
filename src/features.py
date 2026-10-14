@@ -63,6 +63,10 @@ class FeatureRegistry:
             raise ValueError(f"feature already registered: {feature.name}")
         self._features[feature.name] = feature
 
+    def get(self, name: str):
+        """Return the registered feature by name (None if absent)."""
+        return self._features.get(name)
+
     def names(self) -> list[str]:
         return list(self._features)
 
