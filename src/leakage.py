@@ -164,10 +164,11 @@ def audit_feature(feature: Feature, ctx: dict, scored_df: pd.DataFrame) -> Audit
     prov = feature.provenance or {}
 
     # ---- A. declaration checks (v1) -------------------------------------
-    if feature.point_in_time not in scored_df.columns:
+    scope = prov.get("temporal_scope")
+    # Static scope: row-local features, no timestamp needed.
+    if scope != "static" and feature.point_in_time not in scored_df.columns:
         fail(f"point_in_time column '{feature.point_in_time}' not in scored frame")
 
-    scope = prov.get("temporal_scope")
     if not scope:
         fail("no temporal_scope declared in provenance")
     elif scope in FAIL_SCOPES:
@@ -232,6 +233,14 @@ def audit_feature(feature: Feature, ctx: dict, scored_df: pd.DataFrame) -> Audit
             fail(f"claims temporal_scope='pit_correct' but the code never "
                  f"references prediction time ('{pit}') or as-of logic -- "
                  f"declaration not credible (code inspection)")
+
+    # B5. target-column check: a feature must never read the target.
+    # (The DANGEROUS_COLUMNS list is MovieLens-specific; the target is
+    # per-brief and comes via ctx.)
+    _target_col = ctx.get("_target_column")
+    if _target_col and _target_col in lits:
+        fail(f"code references target column '{_target_col}' -- "
+             f"TARGET LEAKAGE (code inspection)")
 
     if passed:
         reasons.append("code inspection: no dangerous sources, "

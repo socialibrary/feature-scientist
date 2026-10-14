@@ -36,11 +36,18 @@ def load_entries(path: str = LEDGER_PATH) -> list[dict]:
 def build_entry(round_no: int, hypothesis, feature, audit_result,
                 cost_verdict, metrics: dict | None, verdict: str,
                 reason: str, agentic: dict | None = None,
-                brief: dict | None = None) -> dict:
+                brief: dict | None = None,
+                champion: dict | None = None) -> dict:
     try:
         code = inspect.getsource(feature.compute)
     except (OSError, TypeError):
         code = "<source unavailable>"
+    if metrics is not None and champion is not None:
+        # Champion tracking (cumulative iteration): the running total
+        # (auc, log_loss, deltas vs the base baseline, # accepted features)
+        # is stamped on every entry once training runs begin.
+        metrics = dict(metrics)
+        metrics["champion"] = champion
     return {
         "round": round_no,
         "hypothesis": hypothesis.text,
