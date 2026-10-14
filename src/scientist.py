@@ -534,12 +534,20 @@ class LLMEngine(HypothesisEngine):
 
     def __init__(self, backend: str | None = None,
                  problem_context: dict | None = None):
-        from llm_backend import HTTPBackend, ScriptedBackend
+        from llm_backend import (HTTPBackend, NebiusBackend, ScriptedBackend,
+                                   SpaceshipTitanicBackend,
+                                   TabularScriptedBackend)
         be = backend or os.environ.get("FS_LLM_BACKEND", "http")
         if be == "scripted":
             self.backend = ScriptedBackend()
+        elif be == "tabular-scripted":
+            self.backend = TabularScriptedBackend()
+        elif be == "st-domain":
+            self.backend = SpaceshipTitanicBackend()
         elif be == "http":
             self.backend = HTTPBackend()
+        elif be == "nebius":
+            self.backend = NebiusBackend()
         else:
             raise ValueError(f"unknown LLM backend: {be!r}")
         # Brief-driven runs: the problem statement + temporal contract.
@@ -580,17 +588,30 @@ class LLMEngine(HypothesisEngine):
                       round_no: int) -> str:
         import json as _json
         worst = error_slices.get("worst", [])[:5]
+        # Slice-targeted: emphasize the #1 problem for focused hypotheses.
+        _target_block = ""
+        if worst:
+            _top = worst[0]
+            _target_block = (
+                f"\nPRIORITY TARGET: The model's worst problem is "
+                f"'{_top.get('slice')}' -- error rate "
+                f"{_top.get('error_rate', 0):.1%} "
+                f"(+{_top.get('lift_pp', 0):.1f}pp vs overall), "
+                f"covering {_top.get('fraction', 0):.1%} of data. "
+                f"At least one hypothesis MUST specifically address this slice.\n"
+            )
         return (
             self._problem_block()
-            + "You are a feature-discovery scientist for a movie recommender "
-            "(MovieLens-1M: 1M ratings, 6k users, 3.9k movies). "
-            "Two-tower baseline AUC 0.7410. Propose exactly 2 falsifiable "
+            + "You are a feature-discovery scientist. "
+            "Propose exactly 2 falsifiable "
             "hypotheses about what INFORMATION the model is missing -- not "
-            "hyperparameters, not model changes.\n\n"
+            "hyperparameters, not model changes.\n"
+            + _target_block + "\n"
             f"Worst error slices (validation AUC by slice -- propose for "
             f"these):\n{_json.dumps(worst)}\n\n"
             f"Data catalog:\n{_json.dumps(catalog, default=str)[:3000]}\n\n"
-            + _CTX_API_REFERENCE + "\n\n"
+            + (_GENERIC_CTX_API_REFERENCE
+               if self._is_generic_task() else _CTX_API_REFERENCE) + "\n\n"
             "Respond ONLY with JSON:\n"
             "{\n"
             '  "reasoning": "<free-form: which slices, what information is '
@@ -598,17 +619,20 @@ class LLMEngine(HypothesisEngine):
             '  "hypotheses": [\n'
             '    {"name": "<snake_case>", "text": "<plain-English hypothesis>",\n'
             '     "sources": ["<catalog keys>"], "point_in_time": "timestamp",\n'
-            '     "temporal_scope": "train_only|pit_correct|static",\n'
-            '     "tower": "user|movie|wide", "serving": "<pattern>",\n'
+            '     "temporal_scope": "<EXACTLY ONE OF: train_only | pit_correct '
+            '| static | all_time -- no other text>",\n'
+            '     "tower": "<EXACTLY ONE OF: user | movie | wide>", '
+            '"serving": "<EXACTLY ONE OF: row_local | lookup | history_scan>",\n'
             '     "serving_notes": "<why this pattern>",\n'
             '     "code": "def compute(df, ctx):\\n    ..."}\n'
             "  ]\n"
             "}\n"
-            "WARNING: imdb_averageRating / imdb_numVotes / ctx['imdb_map_avg'] "
-            "are ALL-TIME aggregates (votes through Oct 2026). Using them raw "
-            "to score a 2001 rating is TEMPORAL LEAKAGE and the deterministic "
-            "audit WILL reject it. Either build a point-in-time-correct "
-            "version or don't use them."
+            + ("" if self._is_generic_task() else
+               "WARNING: imdb_averageRating / imdb_numVotes / ctx['imdb_map_avg'] "
+               "are ALL-TIME aggregates (votes through Oct 2026). Using them raw "
+               "to score a 2001 rating is TEMPORAL LEAKAGE and the deterministic "
+               "audit WILL reject it. Either build a point-in-time-correct "
+               "version or don't use them.")
         )
 
     def propose(self, error_slices: dict, catalog: dict,
@@ -647,6 +671,21 @@ class LLMEngine(HypothesisEngine):
 
 
 # API reference shipped inside the LLM prompt: what generated code may touch.
+    def _is_generic_task(self) -> bool:
+        """True if this is not a MovieLens task (generic tabular)."""
+        pc = self.problem_context or {}
+        prob = str(pc.get("problem", "")).lower()
+        # MovieLens tasks mention movies, ratings, users.
+        return not any(k in prob for k in ("movie", "rating", "user like"))
+
+_GENERIC_CTX_API_REFERENCE = """\
+API reference — your feature code runs as `def compute(df, ctx):` and must
+return a pd.Series aligned to df.index. The restricted namespace provides
+only pd (pandas), np (numpy) and safe builtins. NO imports, NO I/O,
+NO eval/exec/open. df has the columns from the profiled tables above.
+ctx is empty for generic tasks (features must be row-local).
+"""
+
 _CTX_API_REFERENCE = """\
 API reference — your feature code runs as `def compute(df, ctx):` and must
 return a pd.Series aligned to df.index. The restricted namespace provides
@@ -665,6 +704,15 @@ ctx tables you may read:
 - global_mean / global_like: train scalars (safe)
 - imdb (DataFrame), imdb_map_avg: ALL-TIME IMDb aggregates — DANGEROUS
 - movie_mean_all: means over train+validation — DANGEROUS (future data)
+- movie_budget_log: {movie_id: log10(budget_amount)}; budgets are locked
+  pre-release (PIT-safe, time-invariant). Sparse: 32% coverage, missing ->
+  ctx["budget_log_median"] (train-period scalar). Declared honestly.
+- movie_non_english: {movie_id: 0.0/1.0}, 1.0 when original_language !=
+  English(Q1860); 98% coverage, missing -> 0.0. Time-invariant (safe).
+- movie_award_count: {movie_id: award count} -- ALL-TIME as of crawl, 24%
+  coverage, DANGEROUS: wins may postdate prediction time. Declaring
+  temporal_scope=all_time is honest; the audit WILL reject it (fail-closed).
+  There is no PIT-correct version -- the awards table has no per-award dates.
 
 Point-in-time rules: for each scored row with prediction time T you may only
 use source data with time <= T, time-invariant metadata, or train-period
