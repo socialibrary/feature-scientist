@@ -52,7 +52,7 @@ USER_COLS = ["user_rating_count", "user_mean_rating", "gender_m", "age",
 # movie cols = movie aggregates + genre one-hots (resolved dynamically)
 MOVIE_AGG_COLS = ["movie_rating_count", "movie_mean_rating"]
 
-EPOCHS = 4
+EPOCHS = 8
 BATCH_SIZE = 65536
 EMB_DIM = 48
 ID_EMB_DIM = 16
@@ -62,6 +62,34 @@ SEED = 42
 
 def _movie_cols(X: pd.DataFrame) -> list[str]:
     return MOVIE_AGG_COLS + [c for c in X.columns if c.startswith("genre_")]
+
+
+def _normalize_extra(extra: dict) -> dict:
+    """Normalize the `extra` spec to {tower: [(name, ctr, cva), ...]}.
+
+    Accepts two forms per tower:
+      * legacy: (ctr, cva)                      -- one unnamed column
+      * multi:  [(name, ctr, cva), ...]          -- any number of named columns
+    Same-tower columns are sorted by name so concatenation order is
+    deterministic regardless of insertion order.
+    """
+    norm = {}
+    for tower, v in extra.items():
+        if isinstance(v, list):
+            items = list(v)
+        elif isinstance(v, tuple) and len(v) == 3 and isinstance(v[0], str):
+            items = [v]
+        elif isinstance(v, tuple) and len(v) == 2:
+            items = [("", v[0], v[1])]  # legacy unnamed form
+        else:
+            raise ValueError(f"bad extra entry for tower {tower!r}: {type(v)}")
+        for it in items:
+            if not (isinstance(it, tuple) and len(it) == 3
+                    and isinstance(it[0], str)):
+                raise ValueError(
+                    f"bad extra item for tower {tower!r}: {str(it)[:80]}")
+        norm[tower] = sorted(items, key=lambda t: t[0])
+    return norm
 
 
 def _mlp(d_in: int, emb_dim: int) -> nn.Sequential:
@@ -103,6 +131,14 @@ class TwoTower(nn.Module):
         return logit
 
 
+def _writable_int64(s: pd.Series) -> np.ndarray:
+    """pandas .map().to_numpy() can return read-only arrays, which
+    torch.from_numpy rejects with a warning (undefined behavior on write).
+    Guarantee a writable int64 array."""
+    a = s.to_numpy(np.int64)
+    return a if a.flags.writeable else a.copy()
+
+
 def _id_map(ids: pd.Series) -> dict:
     """Map raw IDs to 1-based embedding indices; 0 = unknown (cold ID)."""
     uniq = sorted(pd.unique(ids))
@@ -126,10 +162,10 @@ def prepare_tower_inputs(train: pd.DataFrame, valid: pd.DataFrame,
         "movie_cols": mcols,
         "Xu_train": Xt[USER_COLS].to_numpy(np.float32),
         "Xm_train": Xt[mcols].to_numpy(np.float32),
-        "iu_train": train["user_id"].map(user_map).fillna(0).to_numpy(np.int64),
-        "im_train": train["movie_id"].map(movie_map).fillna(0).to_numpy(np.int64),
-        "iu_valid": valid["user_id"].map(user_map).fillna(0).to_numpy(np.int64),
-        "im_valid": valid["movie_id"].map(movie_map).fillna(0).to_numpy(np.int64),
+        "iu_train": _writable_int64(train["user_id"].map(user_map).fillna(0)),
+        "im_train": _writable_int64(train["movie_id"].map(movie_map).fillna(0)),
+        "iu_valid": _writable_int64(valid["user_id"].map(user_map).fillna(0)),
+        "im_valid": _writable_int64(valid["movie_id"].map(movie_map).fillna(0)),
         "n_users": len(user_map),
         "n_movies": len(movie_map),
         "Xu_valid": Xv[USER_COLS].to_numpy(np.float32),
@@ -153,9 +189,12 @@ def train_two_tower(prep: dict, extra: dict | None = None,
                     verbose: bool = True) -> dict:
     """Train the two-tower model.
 
-    extra: {tower: (train_col_2d, valid_col_2d)} with tower in
-    {"user", "movie", "wide"}. Extra columns are standardized with their own
-    train-fit scaler and appended to that tower's input (or the wide term).
+    extra: {tower: (train_col_2d, valid_col_2d)} (legacy, one column per
+    tower) or {tower: [(name, train_col_2d, valid_col_2d), ...]} (any number
+    of named columns per tower; concatenated in name-sorted order).
+    Tower in {"user", "movie", "wide"}. Extra columns are standardized with
+    their own train-fit scaler (one scaler per column) and appended to that
+    tower's input (or the wide term).
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -167,10 +206,18 @@ def train_two_tower(prep: dict, extra: dict | None = None,
     d_wide = 0
     if extra:
         w_tr_parts, w_va_parts = [], []
-        for tower, (ctr, cva) in extra.items():
-            ctr = np.asarray(ctr, dtype=np.float32).reshape(len(ctr), -1)
-            cva = np.asarray(cva, dtype=np.float32).reshape(len(cva), -1)
-            str_, sva, _ = _scale(ctr, cva)
+        for tower, items in _normalize_extra(extra).items():
+            if tower not in ("user", "movie", "wide"):
+                raise ValueError(f"unknown tower: {tower}")
+            s_tr_parts, s_va_parts = [], []
+            for _name, ctr, cva in items:
+                ctr = np.asarray(ctr, dtype=np.float32).reshape(len(ctr), -1)
+                cva = np.asarray(cva, dtype=np.float32).reshape(len(cva), -1)
+                str_, sva, _ = _scale(ctr, cva)
+                s_tr_parts.append(str_)
+                s_va_parts.append(sva)
+            str_ = np.concatenate(s_tr_parts, axis=1)
+            sva = np.concatenate(s_va_parts, axis=1)
             if tower == "user":
                 Xu_tr = np.concatenate([Xu_tr, str_], axis=1)
                 Xu_va = np.concatenate([Xu_va, sva], axis=1)
@@ -180,14 +227,12 @@ def train_two_tower(prep: dict, extra: dict | None = None,
             elif tower == "wide":
                 w_tr_parts.append(str_)
                 w_va_parts.append(sva)
-            else:
-                raise ValueError(f"unknown tower: {tower}")
         if w_tr_parts:
             wide_tr = np.concatenate(w_tr_parts, axis=1)
             wide_va = np.concatenate(w_va_parts, axis=1)
             d_wide = wide_tr.shape[1]
 
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = TwoTower(Xu_tr.shape[1], Xm_tr.shape[1], d_wide, emb_dim,
                      n_users=prep.get("n_users", 0),
                      n_movies=prep.get("n_movies", 0),
@@ -225,6 +270,11 @@ def train_two_tower(prep: dict, extra: dict | None = None,
         tot, nb = 0.0, 0
         for batch in loader:
             xu, xm, iu, im, xw, y = _unpack(batch, True)
+            xu, xm, y = xu.to(device), xm.to(device), y.to(device)
+            if iu is not None:
+                iu, im = iu.to(device), im.to(device)
+            if xw is not None:
+                xw = xw.to(device)
             opt.zero_grad()
             loss = loss_fn(model(xu, xm, iu, im, xw), y)
             loss.backward()
@@ -246,7 +296,12 @@ def train_two_tower(prep: dict, extra: dict | None = None,
         vloader = DataLoader(TensorDataset(*tensors_va), batch_size=batch_size)
         for batch in vloader:
             xu, xm, iu, im, xw, _ = _unpack(batch, False)
-            logits.append(model(xu, xm, iu, im, xw))
+            xu, xm = xu.to(device), xm.to(device)
+            if iu is not None:
+                iu, im = iu.to(device), im.to(device)
+            if xw is not None:
+                xw = xw.to(device)
+            logits.append(model(xu, xm, iu, im, xw).cpu())
         proba = torch.sigmoid(torch.cat(logits)).numpy()
 
     yv = prep["y_valid"]
