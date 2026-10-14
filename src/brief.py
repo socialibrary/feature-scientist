@@ -262,6 +262,34 @@ def _table_defs() -> dict[str, tuple[str, object]]:
             "imdb_enrichment": ("imdb_enrichment", _load_imdb),
             "wikidata_movies": ("wikidata_movies", _load_wikidata),
         }
+        # Generic Kaggle CSV loaders: data/kaggle/<dataset>/{train,test}.csv
+        # Auto-scanned: any directory under data/kaggle/ containing a
+        # train.csv registers as <dataset-slug>_train / _test. Legacy short
+        # prefixes are kept as aliases so existing briefs (hp_/st_/nm_)
+        # keep working; new briefs use the dataset slug directly.
+        import os as _os
+        _kaggle_base = _os.path.join(_os.path.dirname(_os.path.dirname(
+            _os.path.abspath(__file__))), "data", "kaggle")
+        _legacy_prefix = {"house-price": "hp", "spaceship-titanic": "st",
+                          "nomad2018": "nm"}
+        for _ds in sorted(_os.listdir(_kaggle_base)):
+            _ddir = _os.path.join(_kaggle_base, _ds)
+            if not _os.path.isdir(_ddir):
+                continue
+            _prefixes = {_ds}
+            if _ds in _legacy_prefix:
+                _prefixes.add(_legacy_prefix[_ds])
+            for _prefix in sorted(_prefixes):
+                for _split in ("train", "test"):
+                    _path = _os.path.join(_ddir, f"{_split}.csv")
+                    if not _os.path.exists(_path):
+                        continue
+
+                    def _mk_loader(p=_path):
+                        import pandas as _pd
+                        return lambda: _pd.read_csv(p)
+                    TABLE_DEFS[f"{_prefix}_{_split}"] = (
+                        f"kaggle_{_ds}_{_split}", _mk_loader())
     return TABLE_DEFS
 
 
@@ -293,6 +321,8 @@ def _jsonable(x):
         return int(x)
     if isinstance(x, (np.floating,)):
         return float(x)
+    if isinstance(x, (np.bool_,)):
+        return bool(x)
     return x
 
 
@@ -547,13 +577,17 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description="Feature Scientist: run an ML problem from a brief YAML")
     ap.add_argument("brief", help="path to the brief YAML (or JSON)")
-    ap.add_argument("--backend", choices=["http", "scripted"], default=None,
+    ap.add_argument("--backend", choices=["http", "scripted", "nebius", "tabular-scripted", "st-domain"], default=None,
                     help="LLM backend (default: brief's, else scripted)")
     ap.add_argument("--engine", choices=["rule", "llm"], default=None,
                     help="hypothesis engine (default: brief's, else llm)")
     ap.add_argument("--model", choices=["torch", "lgbm"], default=None,
                     help="model backend (default: brief's, else torch)")
     ap.add_argument("--max-rounds", type=int, default=None)
+    ap.add_argument("--deploy", choices=["none", "huggingface", "nebius"],
+                    default=None,
+                    help="deployment target for the champion model "
+                    "(default: brief's 'deploy' key, else none)")
     args = ap.parse_args()
 
     brief = parse_brief(args.brief)
@@ -563,6 +597,7 @@ def main() -> None:
     stop_cfg = brief.get("stop_when", {}) or {}
     max_rounds = args.max_rounds or stop_cfg.get("max_rounds", 3)
     stop_on_no_signal = bool(stop_cfg.get("stop_on_no_signal", True))
+    deploy_target = args.deploy or brief.get("deploy") or "none"
 
     print("=" * 60)
     print("BRIEF")
@@ -578,7 +613,25 @@ def main() -> None:
     profile_brief_tables(brief)
 
     # 2. catalog = registry + profiling fields (extends, doesn't fork) -----
-    catalog = load_profiled_catalog()
+    _is_generic_brief = any(t["name"].endswith("_train")
+                            for t in brief.get("tables", []))
+    if _is_generic_brief:
+        # Generic tabular task: catalog is the profiled tables themselves.
+        import json as _json2
+        catalog = {}
+        if os.path.exists(PROFILING_JSON):
+            _doc = _json2.load(open(PROFILING_JSON, encoding="utf-8"))
+            for _tn, _tp in _doc.get("tables", {}).items():
+                if _tn.endswith("_train"):
+                    _cols = {}
+                    for _cn, _ci in (_tp.get("columns") or {}).items():
+                        _cols[_cn] = {"dtype": str(_ci.get("dtype", "?")),
+                                      "null_rate": _ci.get("null_rate"),
+                                      "n_unique": _ci.get("n_unique")}
+                    catalog[_tn] = {"n_rows": _tp.get("n_rows"),
+                                    "columns": _cols}
+    else:
+        catalog = load_profiled_catalog()
 
     # 3. serving budgets from the brief (module constants, restored after)
     import serving_cost
@@ -598,14 +651,21 @@ def main() -> None:
                "prediction_time": brief.get("prediction_time", "")}
 
     from run_scientist import print_summary, run
+    # 0-1 vision: every brief run saves its champion for deployment.
+    _slug = os.path.splitext(os.path.basename(args.brief))[0]
+    _champion_path = os.path.join(BASE, "results",
+                                  f"champion_{_slug}.pkl")
     try:
+        # Generic tabular briefs skip the MovieLens-specific calibration screen.
+        _is_generic = any(t["name"].endswith("_train") for t in brief.get("tables", []))
         entries = run(
             rounds=max_rounds, engine_name=engine, model_backend=model,
             llm_backend=llm_backend,
-            calibration_screen=True,
-            screen_battery_fn=build_screen_battery,
+            calibration_screen=not _is_generic,
+            screen_battery_fn=None if _is_generic else build_screen_battery,
             stop_on_no_signal=stop_on_no_signal,
-            problem=problem, skip_accepted=True, catalog=catalog)
+            problem=problem, skip_accepted=True, catalog=catalog,
+            brief=brief, save_champion=_champion_path)
     finally:
         serving_cost.MAX_FEATURE_UNITS = old_feat
         serving_cost.MAX_TOTAL_UNITS = old_total
@@ -613,6 +673,24 @@ def main() -> None:
     from ledger import load_entries
     print(f"\nledger: results/experiments.jsonl "
           f"({len(load_entries())} entries total)")
+
+    # --- deployment ------------------------------------------------------
+    if deploy_target == "huggingface":
+        if os.path.exists(_champion_path):
+            from deploy import deploy_to_huggingface
+            repo = f"feature-scientist-{_slug}"
+            print(f"\ndeploying champion to Hugging Face ({repo})...")
+            try:
+                url = deploy_to_huggingface(_champion_path, repo)
+                print(f"live at {url}")
+            except Exception as e:  # noqa: BLE001 -- report, don't crash
+                print(f"\nupload failed: {e}")
+        else:
+            print("\nno champion saved (no accepted features); "
+                  "nothing to deploy.")
+    elif deploy_target == "nebius":
+        print("\nNebius deploy target is not implemented yet "
+              "(needs S3 keys from your Nebius console).")
 
 
 if __name__ == "__main__":

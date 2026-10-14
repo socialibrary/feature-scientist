@@ -73,11 +73,22 @@ def _materialize_or_fail(spec, ctx, train):
     return feature, None
 
 
-def _is_duplicate(run_ctx: dict, feature) -> bool:
-    """Brief mode: has this feature already been accepted? Checked after
-    EVERY materialization -- a revision can converge onto an accepted name."""
-    return bool(run_ctx.get("skip_accepted")) and feature is not None and \
-        feature.name in run_ctx.get("accepted_names", set())
+def _duplicate_reason(run_ctx: dict, feature):
+    """Brief mode: why is this feature a duplicate, or None if it is not.
+
+    Checked after EVERY materialization -- a revision can converge onto an
+    accepted or already-tested name. Accepted names were re-ablated-proof
+    before; tested (ablated but rejected) names are now skipped too so a
+    scripted backend that repeats proposals cannot burn training runs.
+    """
+    if not run_ctx.get("skip_accepted") or feature is None:
+        return None
+    if feature.name in run_ctx.get("accepted_names", set()):
+        return "already accepted in an earlier round; not re-ablated"
+    if feature.name in run_ctx.get("tested_names", set()):
+        return ("already ablated in an earlier round of this brief; "
+                "not re-tested")
+    return None
 
 
 def process_agentic(r: int, h, run_ctx: dict) -> tuple[dict, float]:
@@ -130,6 +141,30 @@ def process_agentic(r: int, h, run_ctx: dict) -> tuple[dict, float]:
     feature, err = _materialize_or_fail(spec, ctx, train)
     audit = cost = metrics = None
     verdict = reason = None
+    # Retry codegen failures with specific feedback (up to 2 attempts).
+    _codegen_tries = 0
+    while err and _codegen_tries < 2:
+        _codegen_tries += 1
+        fb = f"codegen/smoke test failed: {err}. Fix the code."
+        # Include available columns for KeyError feedback.
+        if "KeyError" in err:
+            try:
+                _cols = list(train.columns)
+                fb += f" Available df columns: {_cols}."
+            except Exception:
+                pass
+        print(f"   codegen retry {_codegen_tries}/2: {err[:100]}")
+        try:
+            old_name = spec.get("name")
+            spec = revise_with_feedback(spec, "codegen", fb, backend, ctx_meta)
+            agentic["revisions"].append(
+                {"stage": "codegen", "feedback": fb,
+                 "from": old_name, "to": spec.get("name"),
+                 "code": spec.get("code", "")})
+            feature, err = _materialize_or_fail(spec, ctx, train)
+        except Exception as e:
+            err = f"revise failed: {e}"
+            break
     if err:
         verdict, reason = "rejected", err
         print(f"   verdict: REJECTED ({reason})")
@@ -137,9 +172,9 @@ def process_agentic(r: int, h, run_ctx: dict) -> tuple[dict, float]:
         print(f"   built feature '{feature.name}' "
               f"(scope={feature.provenance.get('temporal_scope')}, "
               f"serving={feature.serving})")
-        if _is_duplicate(run_ctx, feature):
-            verdict, reason = "duplicate", \
-                "already accepted in an earlier round; not re-ablated"
+        _dr = _duplicate_reason(run_ctx, feature)
+        if _dr is not None:
+            verdict, reason = "duplicate", _dr
             print(f"   verdict: DUPLICATE ({reason})")
 
 
@@ -164,9 +199,9 @@ def process_agentic(r: int, h, run_ctx: dict) -> tuple[dict, float]:
                     feature, err = _materialize_or_fail(spec, ctx, train)
                     if err:
                         verdict, reason = "rejected", err
-                    elif _is_duplicate(run_ctx, feature):
-                        verdict, reason = "duplicate", \
-                            "already accepted in an earlier round; not re-ablated"
+                    elif (_dr := _duplicate_reason(run_ctx,
+                                                   feature)) is not None:
+                        verdict, reason = "duplicate", _dr
                         print(f"   verdict: DUPLICATE ({reason})")
                     else:
                         audit = audit_feature(feature, ctx, valid)
@@ -198,9 +233,9 @@ def process_agentic(r: int, h, run_ctx: dict) -> tuple[dict, float]:
                     feature, err = _materialize_or_fail(spec, ctx, train)
                     if err:
                         verdict, reason = "rejected", err
-                    elif _is_duplicate(run_ctx, feature):
-                        verdict, reason = "duplicate", \
-                            "already accepted in an earlier round; not re-ablated"
+                    elif (_dr := _duplicate_reason(run_ctx,
+                                                   feature)) is not None:
+                        verdict, reason = "duplicate", _dr
                         print(f"   verdict: DUPLICATE ({reason})")
                     else:
                         # A revision can introduce new leakage: re-audit.
@@ -242,31 +277,95 @@ def process_agentic(r: int, h, run_ctx: dict) -> tuple[dict, float]:
         if (verdict is None and audit is not None and audit.passed
                 and cost is not None and cost.passed):
             print("   ablating (baseline + feature)...")
+            # Generic target from brief (if available in run_ctx).
+            _at = None
+            _brief = run_ctx.get("brief")
+            if _brief is not None:
+                from brief_data import parse_target
+                _at = parse_target(_brief.get("label", ""))
+            _metric = run_ctx.get("metric_name", "auc")
             metrics = ablate(train, valid, stats, feature, ctx,
                              base_auc, base_ll,
                              prep=run_ctx.get("prep"),
                              X_train_base=run_ctx.get("X_train_base"),
                              X_valid_base=run_ctx.get("X_valid_base"),
-                             model=model_backend)
-            print(f"   ablation: AUC={metrics['auc']:.4f} "
-                  f"(delta {metrics['delta_auc']:+.4f}), "
-                  f"logloss={metrics['log_loss']:.4f}")
-            agentic["attempts"].append(
-                {"stage": "ablation", "passed": True,
-                 "delta_auc": metrics["delta_auc"]})
-            if metrics["delta_auc"] >= accept_delta:
-                verdict = "accepted"
-                reason = (f"AUC lift {metrics['delta_auc']:+.4f} >= "
-                          f"{accept_delta}")
-                run_ctx["accepted_cost_units"] = cost.new_total_units
-                _an = run_ctx.get("accepted_names")
-                if _an is not None:
-                    _an.add(feature.name)
+                             model=model_backend,
+                             target=_at,
+                             metric=_metric,
+                             baseline_metric=run_ctx.get("base_metric"),
+                             target_transform=run_ctx.get("target_transform"))
+            if _metric == "rmse":
+                print(f"   ablation: RMSE={metrics['rmse']:.4f} "
+                      f"(delta {metrics['delta_rmse']:+.4f})")
+                agentic["attempts"].append(
+                    {"stage": "ablation", "passed": True,
+                     "delta_rmse": metrics["delta_rmse"]})
+                _acc_rmse = run_ctx.get("accept_delta_rmse", 0.0005)
+                if metrics["delta_rmse"] <= -_acc_rmse:
+                    verdict = "accepted"
+                    reason = (f"RMSE improvement "
+                              f"{metrics['delta_rmse']:+.4f} <= {-_acc_rmse}")
+                    run_ctx["accepted_cost_units"] = cost.new_total_units
+                    _an = run_ctx.get("accepted_names")
+                    if _an is not None:
+                        _an.add(feature.name)
+                    _af = run_ctx.get("accepted_features")
+                    if _af is not None:
+                        _af[feature.name] = feature
+                else:
+                    verdict, reason = "rejected", (
+                        f"no improvement (delta_rmse "
+                        f"{metrics['delta_rmse']:+.4f} > {-_acc_rmse})")
+            elif _metric == "logloss":
+                print(f"   ablation: logloss={metrics['log_loss']:.4f} "
+                      f"(delta {metrics['delta_log_loss']:+.4f})")
+                agentic["attempts"].append(
+                    {"stage": "ablation", "passed": True,
+                     "delta_log_loss": metrics["delta_log_loss"]})
+                _acc_ll = run_ctx.get("accept_delta_logloss", 0.0005)
+                if metrics["delta_log_loss"] <= -_acc_ll:
+                    verdict = "accepted"
+                    reason = (f"log-loss improvement "
+                              f"{metrics['delta_log_loss']:+.4f} <= {-_acc_ll}")
+                    run_ctx["accepted_cost_units"] = cost.new_total_units
+                    _an = run_ctx.get("accepted_names")
+                    if _an is not None:
+                        _an.add(feature.name)
+                    _af = run_ctx.get("accepted_features")
+                    if _af is not None:
+                        _af[feature.name] = feature
+                else:
+                    verdict, reason = "rejected", (
+                        f"no improvement (delta_log_loss "
+                        f"{metrics['delta_log_loss']:+.4f} > {-_acc_ll})")
             else:
-                verdict, reason = "rejected", (
-                    f"no lift (delta {metrics['delta_auc']:+.4f} < "
-                    f"{accept_delta})")
+                print(f"   ablation: AUC={metrics['auc']:.4f} "
+                      f"(delta {metrics['delta_auc']:+.4f}), "
+                      f"logloss={metrics['log_loss']:.4f}")
+                agentic["attempts"].append(
+                    {"stage": "ablation", "passed": True,
+                     "delta_auc": metrics["delta_auc"]})
+                if metrics["delta_auc"] >= accept_delta:
+                    verdict = "accepted"
+                    reason = (f"AUC lift {metrics['delta_auc']:+.4f} >= "
+                              f"{accept_delta}")
+                    run_ctx["accepted_cost_units"] = cost.new_total_units
+                    _an = run_ctx.get("accepted_names")
+                    if _an is not None:
+                        _an.add(feature.name)
+                    _af = run_ctx.get("accepted_features")
+                    if _af is not None:
+                        _af[feature.name] = feature
+                else:
+                    verdict, reason = "rejected", (
+                        f"no lift (delta {metrics['delta_auc']:+.4f} < "
+                        f"{accept_delta})")
             print(f"   verdict: {verdict.upper()} ({reason})")
+            # Brief mode: never re-ablate the same feature name in a later
+            # round of this run (scripted backends may repeat proposals).
+            _tn = run_ctx.get("tested_names")
+            if _tn is not None and run_ctx.get("skip_accepted"):
+                _tn.add(feature.name)
         elif verdict is None:
             # Rejected at audit or cost without a successful revision.
             if audit is not None and not audit.passed:
