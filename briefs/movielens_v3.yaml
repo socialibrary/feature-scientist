@@ -1,0 +1,46 @@
+# Feature Scientist brief: MovieLens-1M, fresh-territory round (v3).
+#
+# Context: v2's two single-seed acceptances (movie_age_days,
+# movie_release_year) were both reverted at the 3-seed @ 8-epoch gate --
+# phantoms, same pattern as Oct 4. The honest 1% is not in the pool the
+# deterministic proposer explored. This brief hands the proposer the
+# Wikidata columns the iteration pool never touched with the LLM:
+# budget_amount (32%, pre-release, PIT-safe), original_language (98%,
+# time-invariant), and awards (24%, ALL-TIME -- the fail-closed trap the
+# judgment layer must catch on fresh territory).
+#
+# The scripted v3 arc is deterministic and offline (Nemotron is blocked by
+# the runtime egress policy -- see results/nemotron diagnosis). It stages:
+#   H1 movie_budget_prior_llm  -> critic pass -> audit pass -> cost pass -> ablate
+#   H2 movie_nonenglish_llm    -> critic pass -> audit pass -> cost pass -> ablate
+#   H3 movie_awards_prior_llm  -> critic pass-with-caution -> audit FAILS
+#      (all_time, fail-closed) -> one revise (as-of attempt with no as-of
+#      logic) -> audit kills it again (declaration not credible) -> rejected
+#
+# Run:  FS_SCRIPTED=v3 python3 src/brief.py briefs/movielens_v3.yaml --backend scripted
+#         (~8-epoch ablations on CPU; the ablated features use the honest
+#          8-epoch standard and the 3-seed milestone gate lives in
+#          iterate.py for the iteration driver)
+
+problem: "predict P(user likes movie) for ranking"
+label: "liked = rating >= 4, observed at rating timestamp"
+prediction_time: "score at impression time T; features may only use data with timestamp <= T"
+
+tables:
+  - name: ratings
+    schema_text: "user_id INT, movie_id INT, rating INT (1-5), timestamp BIGINT -- 1,000,209 rows, 2000-04 to 2001-02"
+  - name: users
+    schema_text: "user_id INT, gender STRING, age INT (bucket code), occupation INT (coded 0-20), zip STRING -- 6,040 rows, static demographics"
+  - name: movies
+    schema_text: "movie_id INT, title STRING (with release year), genres STRING (pipe-separated) -- ~3,900 rows"
+  - name: imdb_enrichment
+    schema_text: "movieId INT, tconst STRING, startYear FLOAT, runtimeMinutes FLOAT, directors STRING, imdb_averageRating FLOAT (ALL-TIME aggregate, leakage if used raw), imdb_numVotes FLOAT (ALL-TIME, leakage if used raw) -- 86% of movies"
+  - name: wikidata_movies
+    schema_text: "tconst STRING (= imdb_enrichment.tconst, 99% matched), wikidata_qid STRING, directors STRING (QIDs |-sep, 99%, time_invariant, lookup), cast STRING (QIDs |-sep, 95%, time_invariant, lookup), awards STRING (QIDs |-sep, 24%, ALL_TIME as of crawl -- FAIL-CLOSED: wins may postdate T), box_office_amount FLOAT (27%, ALL-TIME final gross, MIXED CURRENCIES -- leakage if raw), budget_amount FLOAT (32%, locked pre-release, time_invariant, lookup; sparse), release_date STRING (P577 YYYY-MM-DD, 99%, time_invariant, lookup), original_language STRING (P364 QID, 98%, time_invariant, lookup; Q1860=English)"
+
+engine: llm
+backend: scripted
+model: torch
+
+serving: {per_feature_budget: 8, total_budget: 15}
+stop_when: {max_rounds: 3, stop_on_no_signal: true}

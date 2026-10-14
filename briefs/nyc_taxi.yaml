@@ -1,0 +1,32 @@
+# Feature Scientist brief: NYC Taxi Fare Prediction (MLE-bench Lite).
+#
+# Regression: predict fare_amount from trip coordinates/datetime.
+# Metric is RMSE (no transform). Obvious features: haversine distance,
+# hour/day-of-week from pickup_datetime.
+#
+# Run:  python3 src/brief.py briefs/nyc_taxi.yaml
+
+problem: "predict fare_amount (taxi fare in dollars) for regression"
+label: "fare_amount, continuous target in train.csv"
+prediction_time: "n/a (static benchmark; no temporal leakage dimension)"
+
+tables:
+  - name: nyc-taxi_train
+    schema_text: "key TEXT, fare_amount FLOAT, pickup_datetime TEXT, pickup_longitude/latitude FLOAT, dropoff_longitude/latitude FLOAT, passenger_count INT -- 500,000 rows (sampled)"
+  - name: nyc-taxi_test
+    schema_text: "key TEXT, 6 feature columns (same, no fare_amount) -- 9,921 rows"
+
+baseline:
+  description: "LightGBM regressor on raw features"
+  metric: "RMSE on fare_amount"
+
+task_type: regression
+metric: rmse
+target_transform: none
+
+proposal_space: "tabular features"
+
+engine: llm
+backend: tabular-scripted
+model: lgbm
+max_rounds: 3

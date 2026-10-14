@@ -1,0 +1,30 @@
+# Feature Scientist brief: Tabular Playground Series May 2022 (MLE-bench Lite).
+#
+# Binary classification: predict `target` probability from 31 features.
+# Metric is AUC-ROC.
+#
+# Run:  python3 src/brief.py briefs/tps_may_2022.yaml
+
+problem: "predict target (binary class probability) for classification"
+label: "target, binary target in train.csv"
+prediction_time: "n/a (static benchmark; no temporal leakage dimension)"
+
+tables:
+  - name: tps-may-2022_train
+    schema_text: "id INT, 31 feature columns, target INT (0/1) -- 800,000 rows"
+  - name: tps-may-2022_test
+    schema_text: "id INT, 31 feature columns (same, no target) -- 100,000 rows"
+
+baseline:
+  description: "LightGBM classifier on raw features"
+  metric: "AUC-ROC"
+
+task_type: classification
+metric: auc
+
+proposal_space: "tabular features"
+
+engine: llm
+backend: tabular-scripted
+model: lgbm
+max_rounds: 3

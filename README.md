@@ -1,6 +1,6 @@
 # Feature Scientist — Harness + Science Loop + Judgment Layer + Arena UI (Days 1–8)
 
-An autonomous "AI Feature Scientist" agent for the Meta global AI hackathon:
+An autonomous "AI Feature Scientist" agent for the Nebius x NVIDIA Global AI Hackathon:
 given a model and an objective, it figures out **what information the model is
 missing**, invents new features, proves they help, and rejects the ones that
 leak or cost too much to serve.
@@ -246,6 +246,14 @@ export FS_LLM_BASE_URL="https://api.openai.com/v1"   # or the Meta Model API end
 export FS_LLM_API_KEY="..."
 export FS_LLM_MODEL="gpt-4o"                         # or llama-3.3-70b, ...
 .venv/bin/python src/run_scientist.py --rounds 2 --engine llm --backend http
+
+# Nebius Token Factory + NVIDIA Nemotron (Nebius x NVIDIA hackathon path).
+# 1. https://tokenfactory.nebius.com -> create an API key
+# 2. claim $25 credits: code NEBIUS-DEVPOST-GLOBAL26
+export NEBIUS_API_KEY="..."
+.venv/bin/python scripts/smoke_nebius.py   # validates key + model
+.venv/bin/python src/brief.py briefs/movielens.yaml --backend nebius
+# Optional: NEBIUS_MODEL=nvidia/nemotron-3-super-120b-a12b (stronger, pricier)
 ```
 
 No key → clear error + automatic fallback to the rule engine for that
@@ -391,3 +399,51 @@ IMDb / Wikidata loaders in `src/brief.py` are one backend — a warehouse
 (Hive/Spark/Trino) backend implements the same interface. The YAML parser
 is stdlib-only (a documented subset: nested maps, lists of maps, inline
 `{k: v}`, comments); JSON briefs are accepted too.
+
+## Cumulative iteration: stacking features toward +1% AUC / −1% NE
+
+`src/iterate.py` is the metric-target driver. Independent ablations
+(baseline + one feature) can't measure stacking — marginal gains shrink as
+features overlap — so this loop ablates **cumulatively**: every candidate is
+measured marginally against the champion (baseline + all accepted
+features), and a champion model tracks the running total vs the base
+baseline.
+
+```bash
+.venv/bin/python src/iterate.py --rounds 15 --max-ablations-per-round 3
+# target: AUC >= 0.7510 (base 0.7410), log-loss <= 0.5860 (base 0.5919)
+```
+
+How it works:
+
+1. **Plumbing** — `train_two_tower(..., extra=...)` now accepts
+   `{tower: [(name, ctr, cva), ...]}` (any number of named columns per
+   tower, concatenated name-sorted; the old single-tuple form still works).
+   `ablation.ablate_cumulative(accepted, candidate, ...)` trains champion +
+   candidate once and returns both the marginal delta (vs champion, whose
+   single-seed metrics are carried forward) and the total delta (vs base).
+2. **Gap-driven proposer** — a deterministic candidate pool (proven
+   builders + new Wikidata-backed builders in `src/iter_features.py`:
+   `movie_staleness_days` for the measured 4pp recency gap,
+   `actor_track_record_pit` for cast cold-start, `user_recency_30d_lookup`
+   as a lookup-redesigned taste-drift signal, `user_director_affinity`).
+   Each round the calibration battery re-runs against the **champion's**
+   residuals, so the loop chases the next gap instead of rediscovering old
+   ones. (The scripted LLM backend's canned script holds only two
+   hypotheses, both already in the pool — re-proposing them adds no
+   novelty, so the pool is the proposer here.)
+3. **Gates per candidate** — leakage audit → serving-cost gate →
+   deterministic skeptic (rejects candidates |corr| > 0.95 with an accepted
+   feature as redundant information) → calibration screen gate → cumulative
+   ablation. Accept on positive marginal AUC gain.
+4. **Light multi-seed** — ablations stay single-seed for speed, but every
+   acceptance triggers a 3-seed champion milestone
+   (`ablation.evaluate_champion`), and the base baseline is 3-seeded too.
+   The final 1% claim carries mean ± std error bars.
+5. **Ledger** — entries go to `results/iteration_ledger.jsonl` (never the
+   shared `results/experiments.jsonl`), each stamped with the champion
+   snapshot via `ledger.build_entry(..., champion={...})`.
+
+Stops at the target, when no significant gaps remain vs the champion, or
+after 15 rounds. Progress is summarized in
+`results/iteration_summary.json`.

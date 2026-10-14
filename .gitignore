@@ -5,3 +5,4 @@ __pycache__/
 results/
 data/imdb/*.tsv.gz
 src/catalog/profiling.json
+data/wikidata/raw/

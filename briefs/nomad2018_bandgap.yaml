@@ -1,0 +1,31 @@
+# Feature Scientist brief: NOMAD 2018 transparent conductors (MLE-bench Lite).
+#
+# Tabular regression: predict bandgap_energy_ev from 11 material features.
+# Metric is RMSLE == RMSE on log1p(target), same as the house-price setup.
+#
+# Run:  python3 src/brief.py briefs/nomad2018_bandgap.yaml
+
+problem: "predict bandgap_energy_ev (material bandgap energy) for regression"
+label: "bandgap_energy_ev, continuous target in train.csv"
+prediction_time: "n/a (static benchmark; no temporal leakage dimension)"
+
+tables:
+  - name: nm_train
+    schema_text: "id INT, 11 feature columns (spacegroup, number_of_total_atoms, percent_atom_al/ga/in, lattice_vector_1/2/3_ang, lattice_angle_alpha/beta/gamma_degree), bandgap_energy_ev FLOAT -- 2,160 rows"
+  - name: nm_test
+    schema_text: "id INT, 11 feature columns (same, no targets) -- 240 rows"
+
+baseline:
+  description: "LightGBM regressor on raw features"
+  metric: "RMSE on log1p(bandgap_energy_ev) == RMSLE"
+
+task_type: regression
+metric: rmse
+target_transform: log1p
+
+proposal_space: "tabular features"
+
+engine: llm
+backend: tabular-scripted
+model: lgbm
+max_rounds: 3

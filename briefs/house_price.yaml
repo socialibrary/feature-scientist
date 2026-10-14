@@ -1,0 +1,34 @@
+# Feature Scientist brief: House Prices (Kaggle).
+#
+# Tabular regression: predict SalePrice from 79 features.
+# Tests whether the agent loop generalizes beyond MovieLens.
+#
+# Run:  python3 src/brief.py briefs/house_price.yaml
+
+problem: "predict SalePrice (house sale price in dollars) for regression"
+label: "SalePrice, continuous target in train.csv"
+prediction_time: "n/a (static benchmark; no temporal leakage dimension)"
+
+tables:
+  - name: hp_train
+    schema_text: "Id INT, 79 feature columns (MSSubClass, MSZoning, LotArea, OverallQual, YearBuilt, Neighborhood, etc.), SalePrice FLOAT -- 1,460 rows"
+  - name: hp_test
+    schema_text: "Id INT, 79 feature columns (same, no SalePrice) -- 1,459 rows"
+
+baseline:
+  description: "gradient boosting or similar regressor on raw features"
+  metric: "RMSE on log(SalePrice) via Kaggle submission"
+
+# Task configuration (thin per-task adapter: data loading, target, metric).
+task_type: regression        # classification | regression (else auto-detect)
+metric: rmse                 # auc | rmse; computed in the transformed space
+target_transform: log1p      # none | log1p; rmse + log1p == Kaggle RMSLE
+
+proposal_space: "tabular features"
+# The agent profiles the actual data, finds error slices, proposes features,
+# critic checks them, leakage audit verifies no target leakage, ablate measures.
+
+engine: llm
+backend: tabular-scripted
+model: lgbm
+max_rounds: 3

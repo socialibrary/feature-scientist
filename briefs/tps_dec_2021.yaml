@@ -1,0 +1,31 @@
+# Feature Scientist brief: Tabular Playground Series Dec 2021 (MLE-bench Lite).
+#
+# Multi-class classification: predict Cover_Type (7 forest cover classes)
+# from 54 features. Metric is accuracy; the loop gates on log-loss
+# (the right multiclass proxy).
+#
+# Run:  python3 src/brief.py briefs/tps_dec_2021.yaml
+
+problem: "predict Cover_Type (forest cover type, 7 classes) for classification"
+label: "Cover_Type, multiclass target in train.csv"
+prediction_time: "n/a (static benchmark; no temporal leakage dimension)"
+
+tables:
+  - name: tps-dec-2021_train
+    schema_text: "Id INT, 54 feature columns (Elevation, Aspect, Slope, distances, hillshades, soil/wilderness one-hots), Cover_Type INT (1-7) -- 3,600,000 rows"
+  - name: tps-dec-2021_test
+    schema_text: "Id INT, 54 feature columns (same, no Cover_Type) -- 400,000 rows"
+
+baseline:
+  description: "LightGBM multiclass classifier on raw features"
+  metric: "accuracy (loop gates on log-loss)"
+
+task_type: classification
+metric: logloss
+
+proposal_space: "tabular features"
+
+engine: llm
+backend: tabular-scripted
+model: lgbm
+max_rounds: 3

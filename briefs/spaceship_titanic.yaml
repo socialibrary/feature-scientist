@@ -1,0 +1,28 @@
+# Feature Scientist brief: Spaceship Titanic (Kaggle).
+#
+# Tabular classification: predict Transported (whether passenger was transported
+# to another dimension) from 13 features.
+# Tests whether the agent loop generalizes beyond MovieLens.
+#
+# Run:  python3 src/brief.py briefs/spaceship_titanic.yaml
+
+problem: "predict Transported (binary: was passenger transported to another dimension)"
+label: "Transported BOOL, in train.csv"
+prediction_time: "n/a (static benchmark; no temporal leakage dimension)"
+
+tables:
+  - name: st_train
+    schema_text: "PassengerId STRING, HomePlanet, CryoSleep BOOL, Cabin STRING (deck/num/side), Destination, Age FLOAT, VIP BOOL, RoomService/FoodCourt/ShoppingMall/Spa/VRDeck FLOAT (spending), Name STRING, Transported BOOL -- 8,693 rows"
+  - name: st_test
+    schema_text: "PassengerId STRING, same 13 features (no Transported) -- 4,277 rows"
+
+baseline:
+  description: "gradient boosting classifier on raw features"
+  metric: "accuracy via Kaggle submission"
+
+proposal_space: "tabular features"
+
+engine: llm
+backend: tabular-scripted
+model: lgbm
+max_rounds: 3

@@ -1,0 +1,16 @@
+# Generic submitter config for nomad2018-predict-transparent-conductors.
+# Reproduces scripts/nomad_submission.py via scripts/mlebench_submit.py:
+#   python3 scripts/mlebench_submit.py briefs/submit_nomad2018.yaml
+dataset_dir: data/kaggle/nomad2018
+id_column: id
+output: results/nomad2018_submission_generic.csv
+mlebench_competition: nomad2018-predict-transparent-conductors
+targets:
+  - name: bandgap_energy_ev
+    champion: results/champion_nomad2018_bandgap.pkl
+    target_transform: log1p
+    grade: rmsle
+  - name: formation_energy_ev_natom
+    champion: null
+    target_transform: log1p
+    grade: rmsle

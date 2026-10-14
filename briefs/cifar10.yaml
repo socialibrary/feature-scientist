@@ -1,0 +1,32 @@
+# Feature Scientist brief: CIFAR-10 (MLAgentBench).
+#
+# Tests whether the agent loop generalizes beyond tabular features.
+# Here "features" = training/architecture interventions (augmentation,
+# architecture, optimization). The propose -> critic -> ablate -> verdict
+# loop is identical; only the proposal space changes.
+#
+# Run:  python3 src/brief.py briefs/cifar10.yaml
+
+problem: "improve image classification accuracy on CIFAR-10 test set"
+label: "10-class image label (airplane, automobile, bird, cat, deer, dog, frog, horse, ship, truck)"
+prediction_time: "n/a (static benchmark; no temporal leakage dimension)"
+
+tables:
+  - name: train_images
+    schema_text: "50,000 32x32 RGB images, 10 balanced classes -- torchvision CIFAR10(train=True)"
+  - name: test_images
+    schema_text: "10,000 32x32 RGB images, 10 balanced classes -- torchvision CIFAR10(train=False); labels hidden at submit time"
+
+baseline:
+  description: "LeNet-style CNN (conv 3->6, conv 6->16, fc 120->84->10), SGD lr=0.1 momentum=0.9"
+  metric: "test accuracy via submission.csv (per-class probabilities, argmax)"
+
+proposal_space: "architecture | augmentation | optimization | regularization"
+# The agent proposes interventions in this space, not tabular columns.
+# Critic checks: is it a real change? does it risk overfitting the test set?
+# Ablation: train with/without the intervention, compare validation accuracy.
+
+engine: llm
+backend: scripted
+model: torch
+max_rounds: 3
