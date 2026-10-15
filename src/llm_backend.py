@@ -499,7 +499,14 @@ class TabularScriptedBackend(LLMBackend):
         return True
 
     def _get_numeric_cols(self) -> list:
-        """Read numeric columns from the profiled tables (profiling.json)."""
+        """Read numeric columns from the profiled tables (profiling.json).
+
+        The target column is excluded data-driven: any column present in
+        <name>_train but absent from <name>_test is treated as the label
+        (it cannot be a serving-time feature). Replaces the hardcoded name
+        list, which missed 'fare_amount' and burned the nyc-taxi round on
+        leakage-killed hypotheses (Oct 13 2026).
+        """
         import json, os
         # Find profiling.json relative to this file.
         here = os.path.dirname(os.path.abspath(__file__))
@@ -510,16 +517,24 @@ class TabularScriptedBackend(LLMBackend):
             doc = json.load(open(pj, encoding="utf-8"))
         except Exception:
             return []
+        tables = doc.get("tables", {})
+        legacy_exclude = {"id", "saleprice", "transported", "target"}
         numeric = []
-        for tname, tinfo in doc.get("tables", {}).items():
+        for tname, tinfo in tables.items():
             if not tname.endswith("_train"):
                 continue
-            for cname, cinfo in (tinfo.get("columns") or {}).items():
+            train_cols = tinfo.get("columns") or {}
+            test_cols = (tables.get(tname[: -len("_train")] + "_test", {})
+                         .get("columns") or {})
+            target_like = ({c for c in train_cols if c not in test_cols}
+                           if test_cols else set())
+            for cname, cinfo in train_cols.items():
                 if not isinstance(cinfo, dict):
                     continue
                 dt = str(cinfo.get("dtype", ""))
-                if dt.startswith(("int", "float")) and cname.lower() not in (
-                        "id", "saleprice", "transported", "target"):
+                if (dt.startswith(("int", "float"))
+                        and cname.lower() not in legacy_exclude
+                        and cname not in target_like):
                     numeric.append(cname)
             if numeric:
                 break
