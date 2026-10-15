@@ -49,12 +49,12 @@ loop takes ~6 minutes (one ~40s ablation per surviving hypothesis).
 Primary model: **PyTorch two-tower** (`src/two_tower.py`) — user tower
 (5 user-side features → MLP → 48-dim embedding), movie tower (20 movie-side
 features → MLP → 48-dim embedding), dot product + bias, `BCEWithLogitsLoss`.
-Trains on 800k rows in ~80s on CPU (4 epochs, batch 65536).
+Trains on 800k rows on CPU (8 epochs, batch 65536).
 
 | metric | validation |
 |---|---|
-| AUC | **0.7410** |
-| log-loss | **0.5919** |
+| AUC | **0.7496** ± 0.0011 |
+| log-loss | **0.5844** ± 0.0010 |
 
 LightGBM (`src/baseline.py`) remains as a `--model lgbm` fallback
 (AUC 0.7439). The science loop defaults to the two-tower; candidate
@@ -64,9 +64,9 @@ the two-tower baseline.
 
 Learned user/movie ID embeddings (dim 16, index 0 = unknown for cold IDs
 unseen in train) are concatenated onto the tower outputs — on by default,
-`--no-id-embeddings` disables. At 4 epochs they are a wash vs the dense
-baseline (AUC 0.7403 vs 0.7410, within seed noise); they need more epochs
-to pay off. The `--no-id-embeddings` path reproduces the 0.7410 baseline
+`--no-id-embeddings` disables. At 8 epochs the converged baseline is
+AUC 0.7496 ± 0.0011 / log-loss 0.5844 ± 0.0010 (3-seed ledger);
+the `--no-id-embeddings` path reproduces the 0.7496 baseline
 exactly.
 
 Train: 800,168 rows (2000-04-25 → 2000-12-02) · Valid: 200,041 rows
@@ -411,7 +411,7 @@ baseline.
 
 ```bash
 .venv/bin/python src/iterate.py --rounds 15 --max-ablations-per-round 3
-# target: AUC >= 0.7510 (base 0.7410), log-loss <= 0.5860 (base 0.5919)
+# target: AUC >= 0.7596 (base 0.7496), log-loss <= 0.5780 (base 0.5844)
 ```
 
 How it works:
